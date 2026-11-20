@@ -10,7 +10,7 @@ set -Eeuo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$APP_DIR/.env"
 DATA_DIR="$APP_DIR/data"
-SERVICE="cfbot"
+SERVICE="awsbot"
 MODE="docker"; ACTION="install"; TOKEN="${BOT_TOKEN:-}"
 ARGS=("$@")
 
@@ -81,21 +81,62 @@ uninstall() {
 }
 if [ "$ACTION" = "uninstall" ]; then uninstall; exit 0; fi
 
+# ---------- hostname fix (inazuia "sudo: unable to resolve host") ----------
+HN="$(hostname 2>/dev/null || true)"
+if [ -n "$HN" ] && ! getent hosts "$HN" >/dev/null 2>&1; then
+  echo "127.0.1.1 $HN" >> /etc/hosts && ok "Hostname '$HN' imeongezwa kwenye /etc/hosts"
+fi
+
+# ---------- project files check (auto-extract zip kama faili hazipo) ----------
+project_ok() { [ -f "$APP_DIR/docker-compose.yml" ] && [ -f "$APP_DIR/Dockerfile" ] && [ -d "$APP_DIR/src" ]; }
+if ! project_ok; then
+  warn "Faili za mradi hazipo (docker-compose.yml / Dockerfile / src/). Natafuta zip..."
+  ZIP="$(find "$APP_DIR" -maxdepth 1 -name '*.zip' | head -n1)"
+  [ -n "$ZIP" ] || die "Hakuna faili la .zip wala faili za mradi ndani ya $APP_DIR. Pakia mradi kamili kwenye repo."
+  ensure_cmd unzip
+  TMPX="$(mktemp -d)"
+  unzip -q -o "$ZIP" -d "$TMPX" || die "Imeshindwa kufungua $ZIP"
+  SRC_DIR="$(dirname "$(find "$TMPX" -maxdepth 3 -name docker-compose.yml | head -n1)")"
+  [ -f "$SRC_DIR/docker-compose.yml" ] || die "docker-compose.yml haipo ndani ya $ZIP"
+  rm -f "$SRC_DIR/install.sh"          # usiandike juu ya script inayoendesha
+  cp -a "$SRC_DIR"/. "$APP_DIR"/
+  rm -rf "$TMPX"
+  ok "Faili za mradi zimetolewa kutoka $(basename "$ZIP")"
+fi
+# bot.py ikiwa nje ya src/ (kama ilivyopakiwa kwenye repo), iweke ndani ya src/
+if [ -f "$APP_DIR/bot.py" ] && [ ! -f "$APP_DIR/src/bot.py" ]; then
+  mkdir -p "$APP_DIR/src" && cp "$APP_DIR/bot.py" "$APP_DIR/src/bot.py"
+  ok "bot.py imewekwa ndani ya src/"
+fi
+# jina la mradi: cfbot -> awsbot (docker-compose.yml, Dockerfile, README.md)
+for f in docker-compose.yml Dockerfile README.md; do
+  [ -f "$APP_DIR/$f" ] && grep -q 'cfbot' "$APP_DIR/$f" && sed -i 's/cfbot/awsbot/g' "$APP_DIR/$f" && ok "$f: cfbot -> awsbot"
+done
+project_ok || die "Faili za mradi bado hazijakamilika. Hakikisha docker-compose.yml, Dockerfile na src/ zipo."
+
 # ---------- configuration (token only) ----------
 configure() {
   ensure_cmd curl
-  local tok="${TOKEN:-$(env_get BOT_TOKEN)}" interactive=0
-  [ -r /dev/tty ] && interactive=1
+  local saved tok="$TOKEN" interactive=0
+  saved="$(env_get BOT_TOKEN)"
+  { : </dev/tty; } 2>/dev/null && interactive=1
+  [ -z "$tok" ] && [ "$interactive" = 0 ] && tok="$saved"
   while :; do
     if [ -z "$tok" ]; then
       [ "$interactive" = 1 ] || die "Weka token: sudo bash install.sh --token <TOKEN>"
-      printf 'Bot token (kutoka @BotFather): ' >/dev/tty; IFS= read -r tok </dev/tty
+      if [ -n "$saved" ]; then
+        printf 'Bot token (Enter = tumia iliyopo ...%s, au bandika mpya): ' "${saved: -6}" >/dev/tty
+      else
+        printf 'Bandika Bot token kutoka @BotFather kisha bonyeza Enter: ' >/dev/tty
+      fi
+      IFS= read -r tok </dev/tty || true
+      [ -z "${tok//[[:space:]]/}" ] && tok="$saved"
     fi
     tok="${tok//[[:space:]]/}"
     if [[ "$tok" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{30,}$ ]] && check_token "$tok"; then break; fi
-    warn "Token si sahihi."
+    warn "Token si sahihi. Jaribu tena."
     { [ -n "$TOKEN" ] || [ "$interactive" = 0 ]; } && die "Token imekataliwa."
-    tok=""
+    tok=""; saved=""
   done
   env_set BOT_TOKEN "$tok"
   [ -n "$(env_get SECRET_KEY)" ] || { env_set SECRET_KEY "$(rand_key)"; ok "SECRET_KEY imetengenezwa (usiipoteze: inalinda keys za AWS)"; }
@@ -144,7 +185,8 @@ deploy_docker() {
   info "Najenga na kuwasha container..."
   (cd "$APP_DIR" && $DC up -d --build) || die "docker compose imeshindwa"
   sleep 4
-  if [ "$(docker inspect -f '{{.State.Running}}' "$SERVICE" 2>/dev/null)" != "true" ]; then
+  CID="$(cd "$APP_DIR" && $DC ps -q 2>/dev/null | head -n1 || true)"   # haitegemei jina la container
+  if [ -z "$CID" ] || [ "$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)" != "true" ]; then
     (cd "$APP_DIR" && $DC logs --tail 30) || true
     die "Container haiendeshi. Angalia logs hapo juu."
   fi
@@ -155,7 +197,7 @@ cd $APP_DIR && $DC restart       # restart"
 
 # ---------- systemd mode ----------
 deploy_systemd() {
-  case "$APP_DIR" in /root|/root/*|/home/*) die "Mode ya systemd: hamisha repo hadi /opt (mfano: mv $APP_DIR /opt/cfbot) kisha endesha tena." ;; esac
+  case "$APP_DIR" in /root|/root/*|/home/*) die "Mode ya systemd: hamisha repo hadi /opt (mfano: mv $APP_DIR /opt/awsbot) kisha endesha tena." ;; esac
   command -v systemctl >/dev/null 2>&1 || die "systemd haipo. Tumia mode ya Docker."
   if ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then
     info "Nainstall python3 + venv..."
@@ -179,7 +221,7 @@ User=$SERVICE
 WorkingDirectory=$APP_DIR/src
 EnvironmentFile=$ENV_FILE
 Environment=DATA_DIR=$DATA_DIR
-ExecStart=$APP_DIR/venv/bin/python run.py
+ExecStart=$APP_DIR/venv/bin/python bot.py
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
