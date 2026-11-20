@@ -51,10 +51,18 @@ from botocore.exceptions import BotoCoreError, ClientError
 from cryptography.fernet import Fernet
 from telegram import (
     BotCommand,
-    InlineKeyboardButton as B,
+    InlineKeyboardButton,
     InlineKeyboardMarkup as M,
+    LinkPreviewOptions,
     Update,
 )
+
+
+def B(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
@@ -733,13 +741,13 @@ HOME_BTN = [B("🏠 Menu Kuu", "home")]
 CANCEL_HOME = [[B("✖️ Ghairi", "home")]]
 
 
-async def show(u: Update, text: str, rows: Optional[List[List[B]]] = None, force_new: bool = False) -> None:
+async def show(u: Update, text: str, rows: Optional[List[List[InlineKeyboardButton]]] = None, force_new: bool = False) -> None:
     kb = M(rows) if rows else None
     q = u.callback_query
     try:
         if q and not force_new:
             await q.edit_message_text(
-                text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True
+                text, parse_mode="HTML", reply_markup=kb, link_preview_options=NO_PREVIEW
             )
             return
     except BadRequest as e:
@@ -750,7 +758,7 @@ async def show(u: Update, text: str, rows: Optional[List[List[B]]] = None, force
     try:
         if u.effective_message and not force_new:
             await u.effective_message.reply_text(
-                text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True
+                text, parse_mode="HTML", reply_markup=kb, link_preview_options=NO_PREVIEW
             )
             return
     except TelegramError:
@@ -761,7 +769,7 @@ async def show(u: Update, text: str, rows: Optional[List[List[B]]] = None, force
             text=text,
             parse_mode="HTML",
             reply_markup=kb,
-            disable_web_page_preview=True,
+            link_preview_options=NO_PREVIEW,
         )
 
 
@@ -2668,7 +2676,10 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     if u.effective_user.id not in ADMINS:
         return
     c.user_data.pop("flow", None)
-    await h_home(u, c, {})
+    try:
+        await h_home(u, c, {})
+    except Exception as e:
+        await fail(u, e)
 
 
 async def post_init(app: Application) -> None:
