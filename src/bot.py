@@ -4,7 +4,7 @@
 AWS Control Bot — CloudFront & EC2 Full Control Panel (Telegram) [v3 Pro]
 ===============================================================================
 Vipengele Vikuu:
-- Muonekano wa rangi (YAML syntax cards + 🟩/🟨/🟥 bars + ▁▂▃▅▇█ Sparklines)
+- Muonekano wa rangi (Clean Tree Cards + 🟩/🟨/🟥 bars + ▁▂▃▅▇█ Sparklines)
 - Smart Memory Cache (60s TTL) kwa kasi ya papo hapo kwenye Back/Menu
 - CloudFront Full Control: Data + Requests (10M), Sparklines, Clone 1-Click,
   Origin Failover (Add/Switch Origin), Origin & Edge Latency Tester, HTTP/3,
@@ -608,11 +608,94 @@ def progress_bar(val: float, max_val: float, width: int = 10) -> str:
     return block * filled + "⬛" * (width - filled)
 
 
-def yaml_card(rows: List[Tuple[str, str]]) -> str:
-    pad = max((len(k) for k, _ in rows), default=6)
-    lines = [f"{esc(k.ljust(pad))} : {esc(v)}" for k, v in rows]
-    return f'<pre><code class="language-yaml">{chr(10).join(lines)}</code></pre>'
+_KEY_ICONS: Dict[str, str] = {
+    "Accounts": "👤",
+    "Account": "👤",
+    "AWS_ID": "🆔",
+    "IAM_User": "🔑",
+    "CloudFront": "☁️",
+    "Dists": "☁️",
+    "EC2_Reg": "🌍",
+    "FT_Expiry": "⏳",
+    "FT_Left": "⏳",
+    "Alerts": "🔔",
+    "Digest": "🌅",
+    "Digest_Hr": "⏰",
+    "CF_Alert": "📊",
+    "CPU_Alert": "🔥",
+    "Status": "⚡",
+    "State": "⚡",
+    "Port": "🔌",
+    "HTTP_Port": "🔌",
+    "HTTPS_Pt": "🔒",
+    "HTTP": "🚀",
+    "Cache": "⚡",
+    "Viewer": "🔐",
+    "Protocol": "🔒",
+    "Compress": "📦",
+    "IPv6": "🌐",
+    "Price": "💲",
+    "Geo": "🌍",
+    "WAF": "🛡",
+    "Data_7d": "📦",
+    "Data_Mo": "📦",
+    "Data_24h": "📦",
+    "Data_GB": "📦",
+    "CF_Data": "📦",
+    "Reqs_7d": "📈",
+    "Reqs_Mo": "📈",
+    "Reqs_24h": "📈",
+    "Requests": "📈",
+    "CF_Reqs": "📈",
+    "Last_24h": "⏱",
+    "Err_24h": "⚠️",
+    "Err_4xx": "⚠️",
+    "Err_5xx": "🔥",
+    "Origin": "🎯",
+    "Origin_ID": "🆔",
+    "Edge_443": "🌐",
+    "Timeout": "⏱",
+    "Headers": "🛡",
+    "ElasticIP": "🌐",
+    "CPU_1h": "🔥",
+    "Net_Out": "📤",
+    "Net_In": "📥",
+    "Ports": "🛡",
+    "EC2": "🖥",
+    "EC2_Hrs": "🖥",
+    "EC2_Run": "🖥",
+}
 
+
+def yaml_card(rows: List[Tuple[str, str]]) -> str:
+    """Renders a sleek Telegram blockquote card (no YAML code block / no COPY CODE button)."""
+    if not rows:
+        return ""
+    lines = []
+    n = len(rows)
+    for i, (k, raw_v) in enumerate(rows):
+        branch = "╭" if i == 0 and n > 1 else ("╰" if i == n - 1 and n > 1 else ("├" if n > 1 else "•"))
+        icon = _KEY_ICONS.get(k, "•")
+        label = k.replace("_", " ")
+        val = str(raw_v).strip()
+        note = ""
+        if "  # " in val:
+            val, note = val.split("  # ", 1)
+        elif " # " in val:
+            val, note = val.split(" # ", 1)
+        val = val.strip()
+        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+            val = val[1:-1]
+        low = val.lower()
+        if low == "true":
+            val_html = "🟢 <b>ON</b>"
+        elif low == "false":
+            val_html = "🔴 <b>OFF</b>"
+        else:
+            val_html = f"<code>{esc(val)}</code>"
+        note_html = f" <i>({esc(note.strip())})</i>" if note.strip() else ""
+        lines.append(f"{branch} {icon} <b>{esc(label)}:</b> {val_html}{note_html}")
+    return f"<blockquote>{chr(10).join(lines)}</blockquote>"
 
 def clean_domain(s: str) -> Optional[str]:
     s = re.sub(r"^https?://", "", s.strip().lower()).split("/")[0].split(":")[0]
@@ -1147,7 +1230,7 @@ async def h_home(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
         else "<blockquote>⚠️ <b>Bado hujaunganisha AWS account.</b>\n"
         "Bonyeza <b>👤 Accounts → ➕ Add Account</b> kuanza.</blockquote>"
     )
-    text = f"⚡ <b>AWS CONTROL PANEL</b>\n━━━━━━━━━━━━━━━━━━━━\n{card}{hint}"
+    text = f"⚡ <b>AWS CONTROL PANEL</b>\n━━━━━━━━━━━━━━━━━━━━\n{card}\n\n{hint}"
     rows = [
         [B("☁️ CloudFront", "pk|dl"), B("🖥 EC2 Servers", "pk|ec2")],
         [B("➕ Create CF", "pk|cr"), B("🔎 Scan Regions", "pk|scan")],
@@ -1276,22 +1359,21 @@ async def h_ft(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
 
     gb_pct = tot_gb / FREE_TIER_GB * 100
     req_pct = tot_req / FREE_TIER_REQ * 100
-    y_rows = [
-        ("CF_Data", f"{tot_gb:.1f}/1024 GB  # {gb_pct:.0f}%"),
-        ("CF_Reqs", f"{fmt_num(tot_req)}/10M  # {req_pct:.0f}%"),
+
+    usage_lines = [
+        f"📦 <b>CF Data:</b> <code>{tot_gb:.1f} / 1024 GB</code> ({gb_pct:.0f}%)",
+        progress_bar(tot_gb, FREE_TIER_GB),
+        f"📈 <b>CF Reqs:</b> <code>{fmt_num(tot_req)} / 10M</code> ({req_pct:.0f}%)",
+        progress_bar(tot_req, FREE_TIER_REQ),
     ]
     if ft_mod:
-        y_rows += [
-            ("EC2_Hrs", f"{ec2_hrs:.0f}/750h  # proj {ec2_proj:.0f}h"),
-            ("EC2_Run", f"{ec2_run} running  # EBS {ebs_gb}/30 GB"),
+        hrs_pct = ec2_hrs / 750.0 * 100
+        usage_lines += [
+            f"🖥 <b>EC2 Hrs:</b> <code>{ec2_hrs:.0f} / 750h</code> ({hrs_pct:.0f}%) · <i>proj {ec2_proj:.0f}h</i>",
+            progress_bar(ec2_hrs, 750.0),
+            f"💽 <b>EC2 Running:</b> <code>{ec2_run}</code> · <b>EBS:</b> <code>{ebs_gb} / 30 GB</code>",
         ]
-
-    bars = (
-        f"<blockquote>📦 <b>CF Data:</b> {progress_bar(tot_gb, FREE_TIER_GB)} <b>{gb_pct:.0f}%</b>\n"
-        f"📈 <b>CF Reqs:</b> {progress_bar(tot_req, FREE_TIER_REQ)} <b>{req_pct:.0f}%</b>"
-        + (f"\n🖥 <b>EC2 Hrs:</b> {progress_bar(ec2_hrs, 750.0)} <b>{ec2_hrs / 750 * 100:.0f}%</b>" if ft_mod else "")
-        + "</blockquote>"
-    )
+    bars = f"<blockquote>{chr(10).join(usage_lines)}</blockquote>"
 
     # AWS Billing Free Tier API live breakdown (if IAM has freetier:GetFreeTierUsage)
     api_block = ""
@@ -1301,17 +1383,27 @@ async def h_ft(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
             key=lambda x: float(x.get("actualUsageAmount", 0)) / max(1.0, float(x.get("limit", 1))),
             reverse=True,
         )[:6]
-        ec2_ft_active = any("EC2" in (x.get("service", "") + x.get("usageType", "")) for x in ft_items)
-        api_lines = [f"🟢 <b>AWS Free Tier API:</b> EC2 750h {'Active' if ec2_ft_active else 'Haionekani (Huenda imeisha)'}"]
+        ec2_ft_active = any(
+            k in (x.get("service", "") + " " + x.get("usageType", ""))
+            for x in ft_items
+            for k in ("EC2", "Elastic Compute", "BoxUsage")
+        )
+        hdr = "🟢 <b>AWS Billing Free Tier</b> · EC2 750h Active" if ec2_ft_active else "🔵 <b>AWS Billing Free Tier (Live)</b>"
+        api_lines = [hdr]
         for x in top:
             act_v = float(x.get("actualUsageAmount", 0))
             lim_v = float(x.get("limit", 0))
             unit = x.get("unit", "")
             svc = x.get("service", "AWS").replace("Amazon ", "").replace("AWS ", "")
-            api_lines.append(f"• {esc(svc)}: <b>{act_v:.1f}/{lim_v:.0f} {esc(unit)}</b>")
-        api_block = f"\n<blockquote expandable>{chr(10).join(api_lines)}</blockquote>"
+            if "Request" in unit or lim_v >= 10_000:
+                a_s, l_s = fmt_num(act_v), fmt_num(lim_v)
+            else:
+                a_s = f"{act_v:.1f}" if act_v % 1 else f"{int(act_v)}"
+                l_s = f"{lim_v:.0f}"
+            api_lines.append(f"• {esc(svc)}: <code>{a_s}/{l_s}</code> {esc(unit)}")
+        api_block = f"\n\n<blockquote expandable>{chr(10).join(api_lines)}</blockquote>"
     elif ft_err == "denied":
-        api_block = "\n<i>💡 Tip: Ongeza <code>freetier:GetFreeTierUsage</code> na <code>account:GetAccountInformation</code> kwenye IAM Policy kwa taarifa za moja kwa moja za billing.</i>"
+        api_block = "\n<i>💡 Tip: Ongeza <code>freetier:GetFreeTierUsage</code> na <code>account:GetAccountInformation</code> kwenye IAM Policy kwa taarifa za billing.</i>"
 
     next_m = 6 if ft_months == 12 else 12
     rows = [
@@ -1328,7 +1420,7 @@ async def h_ft(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     text = (
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 🛡 <b>Free Tier &amp; Muda</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{exp_block}{bars}{yaml_card(y_rows)}{api_block}"
+        f"{exp_block}\n\n{bars}{api_block}"
     )
     await show(u, text, rows)
 
@@ -1579,7 +1671,7 @@ async def show_cf_detail(u: Update, c: ContextTypes.DEFAULT_TYPE, acc: str, did:
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › ☁️ <code>{did}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"{dot} <b>{title}</b>\n"
-        f"{yaml_card(y_rows)}"
+        f"{yaml_card(y_rows)}\n\n"
         f"<blockquote>{chr(10).join(copy_lines)}</blockquote>"
     )
     if al:
@@ -1658,7 +1750,7 @@ async def h_cf_tst(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -
     text = (
         f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 🩺 <b>Health &amp; Latency Test</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{card}"
+        f"{card}\n\n"
         f"<blockquote>🎯 <b>Origin:</b> <code>{esc(orig_host)}:{port}</code>\n"
         f"🌐 <b>Edge:</b> <code>{edge_host}:443</code>\n\n{diag}</blockquote>"
     )
@@ -1736,7 +1828,7 @@ async def h_om(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     text = (
         f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 🎯 <b>Origin #{oi + 1}/{len(origins)} ({badge})</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{card}"
+        f"{card}\n\n"
         f"<blockquote>🎯 <b>Domain:</b> <code>{esc(o['DomainName'])}</code></blockquote>"
     )
     rows = []
@@ -2190,7 +2282,7 @@ async def h_us(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     text = (
         f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 📊 <b>Analytics</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{bars}{card}"
+        f"{bars}\n\n{card}"
     )
     await show(
         u,
@@ -2243,7 +2335,7 @@ async def h_ua(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     text = (
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 📊 <b>CloudFront Analytics</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{bars}{card}{breakdown}"
+        f"{bars}\n\n{card}{breakdown}"
     )
     await show(u, text, [[B("🔄 Refresh", await cb_put(uid, "ua", acc=acc, fr=1))], HOME_BTN])
 
@@ -2471,7 +2563,7 @@ async def show_ec2_detail(
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 🖥 <b>{reg}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"{dot} <b>{esc(name)}</b>\n"
-        f"{yaml_card(y_rows)}{copy_block}{banner_html}"
+        f"{yaml_card(y_rows)}\n\n{copy_block}{banner_html}"
     )
 
     power_btn = (
@@ -2759,7 +2851,7 @@ async def h_e_met(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) ->
         f"🏠 <b>Home</b> › 🖥 <code>{iid}</code> › 📊 <b>Metrics</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"<blockquote>🔥 <b>CPU Utilization:</b> <b>{m['cpu']:.1f}%</b>\n"
-        f"{progress_bar(m['cpu'], 100.0)}</blockquote>"
+        f"{progress_bar(m['cpu'], 100.0)}</blockquote>\n\n"
         f"{card}"
     )
     await show(
@@ -3312,7 +3404,7 @@ async def send_daily_digest_for_user(bot_obj, uid: int) -> None:
     msg = (
         f"🌅 <b>AWS DAILY DIGEST</b> · <i>{now_local}</i>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        + "".join(sections)
+        + "\n\n".join(sections)
     )
     await bot_obj.send_message(chat_id=uid, text=msg, parse_mode="HTML")
 
