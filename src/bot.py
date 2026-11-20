@@ -3,33 +3,12 @@
 ===============================================================================
 AWS Control Bot — CloudFront & EC2 Full Control Panel (Telegram)
 ===============================================================================
-Matumizi / Setup:
-1. Badili jina la faili hili kuwa:  bot.py
-2. Weka maktaba (packages):
-   pip install "python-telegram-bot[job-queue]>=21.0" boto3 cryptography
-3. Tengeneza SECRET_KEY (Fernet):
-   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-4. Weka Environment Variables (mfano kwenye .env au systemd/Docker):
-   export BOT_TOKEN="123456:ABC-DEF..."
-   export ADMIN_IDS="123456789"          # Tenganisha kwa koma ikiwa admins ni wengi
-   export SECRET_KEY="gAAAAAB..."        # Ufunguo uliotengeneza hatua ya 3
-   export DB_FILE="bot_data.db"          # Hiari (default: bot_data.db)
-   export BACKUP_DIR="backups"           # Hiari (default: backups)
-5. Endesha bot:
-   python3 bot.py
-
-Kumbuka kuhusu AWS IAM Policy (Least Privilege):
-Tumia IAM User mwenye ruhusa za:
-- CloudFront: cloudfront:*
-- ACM (us-east-1): acm:ListCertificates, acm:DescribeCertificate, acm:RequestCertificate
-- CloudWatch: cloudwatch:GetMetricStatistics
-- EC2: ec2:Describe*, ec2:StartInstances, ec2:StopInstances, ec2:RebootInstances,
-       ec2:TerminateInstances, ec2:RunInstances, ec2:AuthorizeSecurityGroupIngress,
-       ec2:RevokeSecurityGroupIngress, ec2:AllocateAddress, ec2:AssociateAddress,
-       ec2:DisassociateAddress, ec2:ReleaseAddress, ec2:CreateSnapshot
-- WAFv2 (hiari): wafv2:ListWebACLs
-- SSM (hiari kwa Run Command): ssm:SendCommand, ssm:GetCommandInvocation
-- STS: sts:GetCallerIdentity
+UI Pro Edition:
+- Dynamic colored progress bars (🟩 / 🟨 / 🟥 + ⬛)
+- Syntax-highlighted YAML telemetry cards (language-yaml)
+- Tree-layout cards (╭ ├ ╰) + 1-tap copyable IDs, IPs, DNS
+- Full CloudFront Requests tracking (Month + 24h vs 10M Free Tier)
+- Compatible with run.py & freetier.py
 ===============================================================================
 """
 
@@ -56,13 +35,6 @@ from telegram import (
     LinkPreviewOptions,
     Update,
 )
-
-
-def B(text: str, data: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text=text, callback_data=data)
-
-
-NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
@@ -72,6 +44,13 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+
+def B(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # ============================= CONFIG & CONSTANTS =============================
 logging.basicConfig(
@@ -97,6 +76,7 @@ CACHING_OPTIMIZED = "658327ea-f89d-4fab-a63d-7e88639e58f6"
 ALL_VIEWER = "216adef6-5c7f-47e4-b989-5492eafa07d3"
 
 FREE_TIER_GB = 1024.0
+FREE_TIER_REQ = 10_000_000.0
 FREE_TIER_INV = 1000
 MAX_BACKUPS_PER_DIST = 10
 
@@ -347,7 +327,6 @@ async def cb_put(uid: int, action: str, **data: Any) -> str:
                     "INSERT INTO cb_tokens (token, uid, payload, created_at) VALUES (?, ?, ?, ?)",
                     (token, uid, payload, now),
                 )
-                # Keep table compact: remove tokens older than 7 days
                 conn.execute("DELETE FROM cb_tokens WHERE created_at < ?", (now - 7 * 86400,))
                 conn.commit()
             finally:
@@ -435,7 +414,7 @@ async def db_alert_recently_sent(alert_key: str, cooldown_sec: int = 86400) -> b
         return await asyncio.to_thread(_op)
 
 
-# ============================= AWS CLIENT & HELPERS =============================
+# ============================= AWS CLIENT & VISUAL HELPERS =============================
 async def aws_client(uid: int, acc: str, svc: str = "cloudfront", region: str = "us-east-1"):
     accounts = await db_get_accounts(uid)
     if acc not in accounts:
@@ -457,10 +436,36 @@ def esc(s: Any) -> str:
     return html.escape(str(s))
 
 
+def fmt_num(n: float) -> str:
+    """Compact human-readable request count: 1.24M, 48.5K, 820."""
+    n = float(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{int(round(n))}"
+
+
 def progress_bar(val: float, max_val: float, width: int = 10) -> str:
+    """Dynamic color progress bar: Green (<60%), Yellow (60-84%), Red (>=85%)."""
     pct = 0.0 if max_val <= 0 else max(0.0, min(1.0, val / max_val))
     filled = int(round(pct * width))
-    return "█" * filled + "░" * (width - filled)
+    if val > 0 and filled == 0:
+        filled = 1
+    if pct >= 0.85:
+        block = "🟥"
+    elif pct >= 0.60:
+        block = "🟨"
+    else:
+        block = "🟩"
+    return block * filled + "⬛" * (width - filled)
+
+
+def yaml_card(rows: List[Tuple[str, str]]) -> str:
+    """Renders aligned YAML inside Telegram's syntax-highlighted code block."""
+    pad = max((len(k) for k, _ in rows), default=6)
+    lines = [f"{esc(k.ljust(pad))} : {esc(v)}" for k, v in rows]
+    return f'<pre><code class="language-yaml">{chr(10).join(lines)}</code></pre>'
 
 
 def clean_domain(s: str) -> Optional[str]:
@@ -477,7 +482,6 @@ def save_dist_backup(did: str, cfg: Dict[str, Any]) -> str:
         os.chmod(path, 0o600)
     except OSError:
         pass
-    # Auto-prune old backups beyond MAX_BACKUPS_PER_DIST
     files = sorted(
         [fn for fn in os.listdir(BACKUP_DIR) if fn.startswith(f"{did}-") and fn.endswith(".json")],
         reverse=True,
@@ -591,34 +595,50 @@ def cw_cf_metrics(cw, did: str) -> Dict[str, float]:
         pts = [p["Average"] for p in r.get("Datapoints", [])]
         return float(sum(pts) / len(pts)) if pts else 0.0
 
-    gb_month = _sum("BytesDownloaded", start_month) / (1024 ** 3)
-    reqs_month = _sum("Requests", start_month)
-    err4xx = _avg("4xxErrorRate", start_24h)
-    err5xx = _avg("5xxErrorRate", start_24h)
     return {
-        "gb": gb_month,
-        "requests": reqs_month,
-        "err4xx": err4xx,
-        "err5xx": err5xx,
+        "gb": _sum("BytesDownloaded", start_month, 86400) / (1024 ** 3),
+        "gb_24h": _sum("BytesDownloaded", start_24h, 3600) / (1024 ** 3),
+        "requests": _sum("Requests", start_month, 86400),
+        "requests_24h": _sum("Requests", start_24h, 3600),
+        "err4xx": _avg("4xxErrorRate", start_24h, 3600),
+        "err5xx": _avg("5xxErrorRate", start_24h, 3600),
     }
 
 
-def cw_cf_month_gb_only(cw, did: str) -> float:
+def cw_cf_month_usage(cw, did: str) -> Tuple[float, float]:
+    """Returns (month_gb, month_requests) for a single CloudFront distribution."""
     now = datetime.now(timezone.utc)
     start_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    r = cw.get_metric_statistics(
+    dims = [
+        {"Name": "DistributionId", "Value": did},
+        {"Name": "Region", "Value": "Global"},
+    ]
+    r_gb = cw.get_metric_statistics(
         Namespace="AWS/CloudFront",
         MetricName="BytesDownloaded",
-        Dimensions=[
-            {"Name": "DistributionId", "Value": did},
-            {"Name": "Region", "Value": "Global"},
-        ],
+        Dimensions=dims,
         StartTime=start_month,
         EndTime=now,
         Period=86400,
         Statistics=["Sum"],
     )
-    return float(sum(p["Sum"] for p in r.get("Datapoints", []))) / (1024 ** 3)
+    r_req = cw.get_metric_statistics(
+        Namespace="AWS/CloudFront",
+        MetricName="Requests",
+        Dimensions=dims,
+        StartTime=start_month,
+        EndTime=now,
+        Period=86400,
+        Statistics=["Sum"],
+    )
+    gb = float(sum(p["Sum"] for p in r_gb.get("Datapoints", []))) / (1024 ** 3)
+    req = float(sum(p["Sum"] for p in r_req.get("Datapoints", [])))
+    return gb, req
+
+
+def cw_cf_month_gb_only(cw, did: str) -> float:
+    gb, _ = cw_cf_month_usage(cw, did)
+    return gb
 
 
 def cf_month_invalidations(cl, did: str) -> Tuple[int, List[Dict[str, Any]]]:
@@ -727,11 +747,11 @@ def ec2_describe_sg_ports(ec2_cl, sg_ids: List[str]) -> Tuple[str, List[Dict[str
             proto = perm.get("IpProtocol")
             p_str = "ALL" if proto == "-1" else (f"{fp}" if fp == tp else f"{fp}-{tp}")
             if perm.get("PrefixListIds"):
-                summary_parts.append(f"{p_str}(CF/PL)")
+                summary_parts.append(f"{p_str}(CF)")
             elif any(x.get("CidrIp") == "0.0.0.0/0" for x in perm.get("IpRanges", [])):
-                summary_parts.append(f"{p_str}(Public)")
+                summary_parts.append(f"{p_str}(Pub)")
             else:
-                summary_parts.append(f"{p_str}(Restricted)")
+                summary_parts.append(f"{p_str}(Priv)")
     unique_summary = ", ".join(dict.fromkeys(summary_parts)) or "Hakuna ports wazi"
     return unique_summary, sgs
 
@@ -741,7 +761,12 @@ HOME_BTN = [B("🏠 Menu Kuu", "home")]
 CANCEL_HOME = [[B("✖️ Ghairi", "home")]]
 
 
-async def show(u: Update, text: str, rows: Optional[List[List[InlineKeyboardButton]]] = None, force_new: bool = False) -> None:
+async def show(
+    u: Update,
+    text: str,
+    rows: Optional[List[List[InlineKeyboardButton]]] = None,
+    force_new: bool = False,
+) -> None:
     kb = M(rows) if rows else None
     q = u.callback_query
     try:
@@ -777,7 +802,7 @@ async def show_loading(u: Update, msg: str = "Inawasiliana na AWS...") -> None:
     q = u.callback_query
     if q:
         try:
-            await q.edit_message_text(f"⏳ <i>{esc(msg)}</i>", parse_mode="HTML")
+            await q.edit_message_text(f"⏳ <b>Tafadhali subiri...</b>\n<blockquote><i>{esc(msg)}</i></blockquote>", parse_mode="HTML")
         except TelegramError:
             pass
 
@@ -795,28 +820,31 @@ async def h_home(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
     uid = u.effective_user.id
     accs = await db_get_accounts(uid)
     st = await db_get_settings(uid)
-    alerts_txt = "ON" if st["alerts_on"] else "OFF"
+    alerts_on = bool(st["alerts_on"])
+    alerts_txt = "ON" if alerts_on else "OFF"
+    acc_list = ", ".join(list(accs.keys())[:4]) if accs else "none"
 
-    summary_block = f"👤 <b>Accounts:</b> <code>{len(accs)}</code>\n"
-    if not accs:
-        summary_block += "ℹ️ <i>Unganisha AWS account kuanza kudhibiti CloudFront na EC2.</i>"
-    else:
-        acc_names = ", ".join(list(accs.keys())[:4])
-        summary_block += (
-            f"🔑 <b>Zilizounganishwa:</b> <code>{esc(acc_names)}</code>\n"
-            f"🔔 <b>Alerts:</b> <code>{alerts_txt}</code> (CF ≥ {st['alert_cf_pct']}% · CPU ≥ {st['alert_cpu_pct']}%)"
-        )
-
-    text = (
-        "⚡ <b>AWS Control Panel</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>{summary_block}</blockquote>\n"
-        "Chagua huduma unayotaka kudhibiti:"
+    card = yaml_card(
+        [
+            ("Accounts", f'{len(accs)}  # {acc_list}'),
+            ("Alerts", "true" if alerts_on else "false"),
+            ("CF_Limit", f"{st['alert_cf_pct']}%  # 1TB · 10M Reqs"),
+            ("CPU_Warn", f"{st['alert_cpu_pct']}%"),
+        ]
     )
+    hint = (
+        "<blockquote>╭ 🟢 <b>Mfumo upo tayari</b>\n"
+        "├ ☁️ Dhibiti CloudFront (Data + Requests)\n"
+        "╰ 🖥 Dhibiti EC2, Firewall &amp; Snapshots</blockquote>"
+        if accs
+        else "<blockquote>⚠️ <b>Bado hujaunganisha AWS account.</b>\n"
+        "Bonyeza <b>👤 Accounts → ➕ Add Account</b> kuanza.</blockquote>"
+    )
+    text = f"⚡ <b>AWS CONTROL PANEL</b>\n━━━━━━━━━━━━━━━━━━━━\n{card}{hint}"
     rows = [
         [B("☁️ CloudFront", "pk|dl"), B("🖥 EC2 Servers", "pk|ec2")],
         [B("➕ Create CF", "pk|cr"), B("🔎 Scan Regions", "pk|scan")],
-        [B("📊 Analytics", "pk|ua"), B(f"🔔 Alerts: {alerts_txt}", "tgl_al")],
+        [B("📊 CF Analytics", "pk|ua"), B(f"🔔 Alerts: {alerts_txt}", "tgl_al")],
         [B("👤 Accounts", "acc"), B("⚙️ Bot Settings", "bset")],
         [B("❓ Msaada", "help")],
     ]
@@ -833,17 +861,17 @@ async def h_tgl_al(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -
 async def h_bset(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
     uid = u.effective_user.id
     st = await db_get_settings(uid)
-    alerts_txt = "🟢 ON" if st["alerts_on"] else "🔴 OFF"
-    text = (
-        "🏠 <b>Home</b> › ⚙️ <b>Bot Settings</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>🔔 <b>Proactive Alerts:</b> {alerts_txt}\n"
-        f"📊 <b>CloudFront Free Tier Alert:</b> <code>{st['alert_cf_pct']}%</code> ya 1024 GB\n"
-        f"🔥 <b>EC2 CPU Alert:</b> <code>{st['alert_cpu_pct']}%</code>\n"
-        f"⏱ <b>Check Interval:</b> kila dakika <code>{st['alert_interval_min']}</code></blockquote>"
+    card = yaml_card(
+        [
+            ("Alerts", "true" if st["alerts_on"] else "false"),
+            ("CF_Alert", f"{st['alert_cf_pct']}%  # GB & Requests"),
+            ("CPU_Alert", f"{st['alert_cpu_pct']}%"),
+            ("Interval", f"{st['alert_interval_min']} min"),
+        ]
     )
+    text = f"🏠 <b>Home</b> › ⚙️ <b>Bot Settings</b>\n━━━━━━━━━━━━━━━━━━━━\n{card}"
     rows = [
-        [B("🔔 Washa/Zima Alerts", "tgl_al_s")],
+        [B("🔔 Washa / Zima Alerts", "tgl_al_s")],
         [B("📊 Badili CF % Alert", "set_cfp"), B("🔥 Badili CPU % Alert", "set_cpup")],
         HOME_BTN,
     ]
@@ -852,13 +880,13 @@ async def h_bset(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
 
 async def h_help(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
     text = (
-        "❓ <b>Mwongozo wa AWS Control Bot</b>\n"
+        "❓ <b>MWONGOZO WA AWS CONTROL BOT</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>1️⃣ <b>Accounts:</b> Unganisha IAM Access Key + Secret Key (husimbwa kwa Fernet AES).\n"
-        "2️⃣ <b>CloudFront:</b> Unda, hariri Origin/HTTP & HTTPS Port, HTTP/3, Cache, Geo, WAF, Custom Headers, ACM SSL, Purge, na Backup/Restore.\n"
-        "3️⃣ <b>EC2 Servers:</b> Chagua Region au bonyeza <i>Scan Regions</i>, Start/Stop/Reboot, Firewall/SG (pamoja na <i>CloudFront Only</i>), Elastic IP, Snapshot, na Run Command (SSM).\n"
-        "4️⃣ <b>EC2 → CloudFront:</b> Unganisha DNS ya EC2 yako moja kwa moja kama Origin ya CloudFront kwa kubonyeza mara moja.\n"
-        "5️⃣ <b>Auto-Notify:</b> Bot inafuatilia Deployments za CloudFront na ACM SSL na kukutumia taarifa ikikamilika.</blockquote>"
+        "<blockquote>╭ 1️⃣ <b>Accounts:</b> Unganisha IAM Keys (Fernet AES).\n"
+        "├ 2️⃣ <b>CloudFront:</b> Data (GB), <b>Requests (10M)</b>, HTTP/3, Ports, Cache, Geo, WAF, ACM SSL, Purge &amp; Restore.\n"
+        "├ 3️⃣ <b>EC2 Servers:</b> Scan Regions, Start/Stop/Reboot, Firewall (<i>CF Only</i>), EIP, Snapshots &amp; SSM.\n"
+        "├ 4️⃣ <b>1-Click Link:</b> Unganisha EC2 DNS moja kwa moja kama CloudFront Origin.\n"
+        "╰ 5️⃣ <b>Free Tier:</b> Tuma /freetier kuona ripoti kamili ya akaunti.</blockquote>"
     )
     await show(u, text, [HOME_BTN])
 
@@ -871,10 +899,9 @@ async def h_pk(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     if not accs:
         return await show(
             u,
-            "⚠️ Bado hujaunganisha AWS account yoyote.",
+            "⚠️ <b>Hakuna AWS Account</b>\n<blockquote>Unganisha account yako ya AWS kwanza.</blockquote>",
             [[B("➕ Add Account", "aa")], HOME_BTN],
         )
-    # Shortcut if only 1 account exists
     if len(accs) == 1:
         only_acc = next(iter(accs))
         if purpose == "dl":
@@ -891,7 +918,7 @@ async def h_pk(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     titles = {
         "dl": "☁️ Chagua account (CloudFront):",
         "cr": "➕ Create CloudFront kwenye account ipi?",
-        "ua": "📊 Analytics za account ipi?",
+        "ua": "📊 CF Analytics za account ipi?",
         "ec2": "🖥 Chagua account (EC2 Servers):",
         "scan": "🔎 Scan EC2 Regions za account ipi?",
     }
@@ -900,7 +927,7 @@ async def h_pk(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
         tok = await cb_put(uid, purpose, acc=name, pg=0)
         rows.append([B(f"👤 {name}", tok)])
     rows.append(HOME_BTN)
-    await show(u, titles.get(purpose, "Chagua account:"), rows)
+    await show(u, f"<b>{titles.get(purpose, 'Chagua account:')}</b>", rows)
 
 
 async def h_acc(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
@@ -910,13 +937,13 @@ async def h_acc(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> N
     for name, info in accs.items():
         t_info = await cb_put(uid, "ai", acc=name)
         t_del = await cb_put(uid, "ad", acc=name)
-        rows.append([B(f"👤 {name} ({info['region']})", t_info), B("🗑", t_del)])
+        rows.append([B(f"👤 {name} · {info['region']}", t_info), B("🗑", t_del)])
     rows += [[B("➕ Add Account", "aa")], HOME_BTN]
     await show(
         u,
         f"🏠 <b>Home</b> › 👤 <b>Accounts ({len(accs)})</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Keys zote zimesimbwa (encrypted) kwenye SQLite.",
+        "<blockquote>🔒 Keys zote zimesimbwa kwa <b>Fernet AES</b> ndani ya SQLite.</blockquote>",
         rows,
     )
 
@@ -925,8 +952,9 @@ async def h_aa(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     c.user_data["flow"] = {"t": "aname"}
     await show(
         u,
-        "➕ <b>Account Mpya</b>\n\n"
-        "Tuma jina fupi la account (herufi/namba/_, max 15). Mfano: <code>aws_main</code>",
+        "➕ <b>Account Mpya ya AWS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>Tuma jina fupi (herufi/namba/_, max 15).\nMfano: <code>aws_main</code></blockquote>",
         CANCEL_HOME,
     )
 
@@ -939,17 +967,21 @@ async def h_ai(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     me, ds = await asyncio.gather(run(sts.get_caller_identity), run(cf_all_dists, cf))
     accs = await db_get_accounts(uid)
     def_reg = accs[acc]["region"]
+    card = yaml_card(
+        [
+            ("Account", f'"{acc}"'),
+            ("AWS_ID", f'"{me["Account"]}"'),
+            ("IAM_User", f'"{me["Arn"].split(":")[-1]}"'),
+            ("CloudFront", f"{len(ds)} distributions"),
+            ("EC2_Reg", f'"{def_reg}"'),
+        ]
+    )
     t_cf = await cb_put(uid, "dl", acc=acc, pg=0)
     t_ec2 = await cb_put(uid, "ec2", acc=acc)
     t_scan = await cb_put(uid, "scan", acc=acc)
     await show(
         u,
-        f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>🆔 <b>AWS Account:</b> <code>{me['Account']}</code>\n"
-        f"👤 <b>IAM ARN:</b> <code>{esc(me['Arn'].split(':')[-1])}</code>\n"
-        f"☁️ <b>CloudFront:</b> <code>{len(ds)}</code> distributions\n"
-        f"🌍 <b>Default EC2 Region:</b> <code>{def_reg}</code></blockquote>",
+        f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b>\n━━━━━━━━━━━━━━━━━━━━\n{card}",
         [
             [B("☁️ CloudFront", t_cf), B("🖥 EC2 Servers", t_ec2)],
             [B("🔎 Scan All EC2 Regions", t_scan)],
@@ -963,7 +995,8 @@ async def h_ad(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     t_ok = await cb_put(uid, "adok", acc=acc)
     await show(
         u,
-        f"🗑 Futa account <b>{esc(acc)}</b> kwenye bot? (AWS yako haiguswi)",
+        f"🗑 <b>Futa account <code>{esc(acc)}</code> kwenye bot?</b>\n"
+        "<blockquote>ℹ️ Akaunti yako ya AWS haiguswi — keys zinaondolewa kwenye bot pekee.</blockquote>",
         [[B("✅ Ndiyo, Futa", t_ok), B("❌ Hapana", "acc")]],
     )
 
@@ -981,6 +1014,9 @@ async def h_dl(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     ds = await run(cf_all_dists, cf)
     per = 8
     chunk = ds[page * per : (page + 1) * per]
+    on_cnt = sum(1 for d in ds if d["Enabled"])
+    dep_cnt = sum(1 for d in ds if d["Status"] != "Deployed")
+
     rows = []
     for d in chunk:
         al = (d.get("Aliases", {}).get("Items") or [d["DomainName"]])[0]
@@ -998,14 +1034,17 @@ async def h_dl(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
         rows.append(nav)
 
     rows += [
-        [B("➕ Create CF", await cb_put(uid, "cr", acc=acc)), B("📊 Analytics", await cb_put(uid, "ua", acc=acc))],
+        [B("➕ Create CF", await cb_put(uid, "cr", acc=acc)), B("📊 Data & Reqs", await cb_put(uid, "ua", acc=acc))],
         HOME_BTN,
     ]
+    summary = (
+        f"<blockquote>╭ ☁️ <b>Jumla:</b> <code>{len(ds)}</code> (Ukurasa {page + 1})\n"
+        f"├ 🟢 <b>Active:</b> <code>{on_cnt}</code> · 🔴 <b>Off:</b> <code>{len(ds) - on_cnt}</code>\n"
+        f"╰ 🟡 <b>Deploying:</b> <code>{dep_cnt}</code></blockquote>"
+    )
     await show(
         u,
-        f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › ☁️ <b>CloudFront</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Jumla ya Distributions: <b>{len(ds)}</b> (Ukurasa {page + 1})",
+        f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › ☁️ <b>CloudFront</b>\n━━━━━━━━━━━━━━━━━━━━\n{summary}",
         rows,
     )
 
@@ -1034,46 +1073,57 @@ async def show_cf_detail(u: Update, c: ContextTypes.DEFAULT_TYPE, acc: str, did:
     status = D["Status"]
     dot = "🟢" if (on and status == "Deployed") else ("🟡" if status != "Deployed" else "🔴")
 
-    proto = co.get("OriginProtocolPolicy", "S3/Other")
+    proto = co.get("OriginProtocolPolicy", "S3")
     if proto == "http-only":
-        port_txt = f"<code>{co.get('HTTPPort', '-')}</code> (http-only)"
+        port_val = f"{co.get('HTTPPort', '-')}  # http-only"
     elif proto == "https-only":
-        port_txt = f"<code>{co.get('HTTPSPort', '-')}</code> (https-only)"
+        port_val = f"{co.get('HTTPSPort', '-')}  # https-only"
     elif proto == "match-viewer":
-        port_txt = f"HTTP <code>{co.get('HTTPPort', '-')}</code> / HTTPS <code>{co.get('HTTPSPort', '-')}</code>"
+        port_val = f"{co.get('HTTPPort', '-')}/{co.get('HTTPSPort', '-')}  # match"
     else:
-        port_txt = "S3 Origin"
+        port_val = '"S3 Origin"'
 
     http_v = cfg.get("HttpVersion", "http2").upper().replace("HTTP2AND3", "HTTP/3")
     dcb = cfg.get("DefaultCacheBehavior", {})
-    cache_lbl = "Disabled" if dcb.get("CachePolicyId") == CACHING_DISABLED else ("Optimized" if dcb.get("CachePolicyId") == CACHING_OPTIMIZED else "Custom")
+    cache_lbl = (
+        "Disabled"
+        if dcb.get("CachePolicyId") == CACHING_DISABLED
+        else ("Optimized" if dcb.get("CachePolicyId") == CACHING_OPTIMIZED else "Custom")
+    )
+    price_short = cfg.get("PriceClass", "-").replace("PriceClass_", "")
 
-    block = (
-        f"🎯 <b>Origin ({len(origins)}):</b> <code>{esc(o['DomainName'])}</code>\n"
-        f"🔌 <b>Port:</b> {port_txt} · {http_v}\n"
-        f"🌐 <b>Edge:</b> <code>{D['DomainName']}</code>\n"
-        f"🔗 <b>Custom:</b> <code>{esc(', '.join(al))}</code>\n" if al else
-        f"🎯 <b>Origin ({len(origins)}):</b> <code>{esc(o['DomainName'])}</code>\n"
-        f"🔌 <b>Port:</b> {port_txt} · {http_v}\n"
-        f"🌐 <b>Edge:</b> <code>{D['DomainName']}</code>\n"
-    )
-    block += (
-        f"⚡ <b>Cache:</b> {cache_lbl} · <b>Cert:</b> {'ACM' if vc.get('ACMCertificateArn') else 'Default'}\n"
-        f"💲 <b>Price:</b> {cfg.get('PriceClass', '-').replace('PriceClass_', '')} · <b>IPv6:</b> {'ON' if cfg.get('IsIPV6Enabled') else 'OFF'}"
-    )
+    y_rows: List[Tuple[str, str]] = [
+        ("Status", f'"{status} ({"ON" if on else "OFF"})"'),
+        ("Port", port_val),
+        ("HTTP", f'"{http_v}"  # {price_short} · IPv6={"on" if cfg.get("IsIPV6Enabled") else "off"}'),
+        ("Cache", f'"{cache_lbl}"  # Cert={"ACM" if vc.get("ACMCertificateArn") else "Default"}'),
+    ]
     if metrics:
-        block += (
-            f"\n📊 <b>Mwezi huu:</b> <code>{metrics['gb']:.2f} GB</code> · "
-            f"Reqs: <code>{int(metrics['requests']):,}</code>\n"
-            f"⚠️ <b>Errors (24h):</b> 4xx <code>{metrics['err4xx']:.1f}%</code> · 5xx <code>{metrics['err5xx']:.1f}%</code>"
-        )
+        gb_pct = metrics["gb"] / FREE_TIER_GB * 100
+        req_pct = metrics["requests"] / FREE_TIER_REQ * 100
+        y_rows += [
+            ("Data_Mo", f"{metrics['gb']:.2f} GB  # {gb_pct:.1f}% of 1TB"),
+            ("Reqs_Mo", f"{fmt_num(metrics['requests'])}  # {req_pct:.1f}% of 10M"),
+            ("Reqs_24h", f"{fmt_num(metrics['requests_24h'])}  # {metrics['gb_24h']:.2f} GB"),
+            ("Err_24h", f"4xx {metrics['err4xx']:.1f}% · 5xx {metrics['err5xx']:.1f}%"),
+        ]
+
+    # 1-tap copyable links/IDs inside blockquote
+    copy_lines = [
+        f"╭ 🆔 <b>ID:</b> <code>{did}</code>",
+        f"├ 🎯 <b>Origin ({len(origins)}):</b> <code>{esc(o['DomainName'])}</code>",
+        f"├ 🌐 <b>Edge:</b> <code>{D['DomainName']}</code>" if al else f"╰ 🌐 <b>Edge:</b> <code>{D['DomainName']}</code>",
+    ]
+    if al:
+        copy_lines.append(f"╰ 🔗 <b>Custom:</b> <code>{esc(', '.join(al))}</code>")
 
     title = esc(cfg.get("Comment") or did)
     text = (
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › ☁️ <code>{did}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{dot} <b>{title}</b> · <i>{status} ({'ON' if on else 'OFF'})</i>\n\n"
-        f"<blockquote>{block}</blockquote>"
+        f"{dot} <b>{title}</b>\n"
+        f"{yaml_card(y_rows)}"
+        f"<blockquote>{chr(10).join(copy_lines)}</blockquote>"
     )
     if al:
         text += f"\n📌 <i>DNS: CNAME → <code>{D['DomainName']}</code> (DNS only)</i>"
@@ -1089,7 +1139,7 @@ async def show_cf_detail(u: Update, c: ContextTypes.DEFAULT_TYPE, acc: str, did:
         ],
         [
             B("🌍 Domains & SSL", await cb_put(uid, "cd", acc=acc, did=did)),
-            B("📊 Analytics", await cb_put(uid, "us", acc=acc, did=did)),
+            B("📊 Data & Reqs", await cb_put(uid, "us", acc=acc, did=did)),
         ],
         [
             B("🧹 Purge", await cb_put(uid, "pm", acc=acc, did=did)),
@@ -1104,7 +1154,7 @@ async def show_cf_detail(u: Update, c: ContextTypes.DEFAULT_TYPE, acc: str, did:
 
 
 async def h_d(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
-    await show_loading(u, f"Inapakia {p['did']}...")
+    await show_loading(u, f"Inapakia {p['did']} (Data + Requests)...")
     await show_cf_detail(u, c, p["acc"], p["did"])
 
 
@@ -1148,17 +1198,23 @@ async def h_om(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     o = origins[oi]
     co = o.get("CustomOriginConfig") or {}
     ch = o.get("CustomHeaders", {}).get("Items") or []
-    hdr_txt = ", ".join(f"{h['HeaderName']}" for h in ch) if ch else "Hakuna"
+    hdr_txt = ", ".join(h["HeaderName"] for h in ch) if ch else "none"
 
+    card = yaml_card(
+        [
+            ("Origin_ID", f'"{o["Id"]}"'),
+            ("HTTP_Port", f"{co.get('HTTPPort', '-')}"),
+            ("HTTPS_Pt", f"{co.get('HTTPSPort', '-')}"),
+            ("Protocol", f'"{co.get("OriginProtocolPolicy", "S3")}"'),
+            ("Timeout", f"{co.get('OriginReadTimeout', '-')}s"),
+            ("Headers", f'"{hdr_txt}"'),
+        ]
+    )
     text = (
         f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 🎯 <b>Origin #{oi + 1}/{len(origins)}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>🆔 <b>Origin ID:</b> <code>{esc(o['Id'])}</code>\n"
-        f"🎯 <b>Domain:</b> <code>{esc(o['DomainName'])}</code>\n"
-        f"🔌 <b>HTTP Port:</b> <code>{co.get('HTTPPort', '-')}</code> · <b>HTTPS Port:</b> <code>{co.get('HTTPSPort', '-')}</code>\n"
-        f"🔒 <b>Protocol:</b> <code>{co.get('OriginProtocolPolicy', 'S3')}</code>\n"
-        f"⏱ <b>Read Timeout:</b> <code>{co.get('OriginReadTimeout', '-')}s</code>\n"
-        f"🛡 <b>Custom Headers:</b> <code>{esc(hdr_txt)}</code></blockquote>"
+        f"{card}"
+        f"<blockquote>🎯 <b>Domain:</b> <code>{esc(o['DomainName'])}</code></blockquote>"
     )
     rows = []
     if len(origins) > 1:
@@ -1205,7 +1261,6 @@ async def h_ch_cl(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) ->
 
 
 async def h_or_ec2(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
-    """Scan active EC2 instances and let user pick one as CloudFront Origin in 1 click."""
     uid, acc, did, oi = u.effective_user.id, p["acc"], p["did"], int(p.get("oi", 0))
     await show_loading(u, "Inatafuta EC2 instances kwenye regions zote...")
     found = await _scan_ec2_all_regions(uid, acc)
@@ -1220,8 +1275,8 @@ async def h_or_ec2(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -
         rows.append([B(f"{dot} {name} ({reg}) · {inst.get('PublicIpAddress', '')}"[:55], tok)])
     rows.append([B("⬅️ Back", await cb_put(uid, "om", acc=acc, did=did, oi=oi))])
     msg = (
-        f"🖥 <b>Chagua EC2 iwe Origin ya <code>{did}</code></b>\n\n"
-        + ("Chagua server hapa chini:" if found else "<i>Hakuna EC2 yenye Public DNS iliyopatikana (hakikisha iko Running).</i>")
+        f"🖥 <b>Chagua EC2 iwe Origin ya <code>{did}</code></b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        + ("Chagua server hapa chini:" if found else "<blockquote><i>Hakuna EC2 yenye Public DNS (hakikisha iko Running).</i></blockquote>")
     )
     await show(u, msg, rows)
 
@@ -1243,22 +1298,24 @@ async def h_sm(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     geo = cfg.get("Restrictions", {}).get("GeoRestriction", {})
     geo_type = geo.get("RestrictionType", "none")
     geo_items = geo.get("Items") or []
-    waf = cfg.get("WebACLId") or "Hakuna"
+    waf = cfg.get("WebACLId") or "none"
     cache_id = dcb.get("CachePolicyId", "")
     cache_lbl = "Disabled" if cache_id == CACHING_DISABLED else ("Optimized" if cache_id == CACHING_OPTIMIZED else "Custom")
 
-    text = (
-        f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › ⚙️ <b>Settings</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>⚡ <b>Cache Policy:</b> <code>{cache_lbl}</code>\n"
-        f"🔐 <b>Viewer Protocol:</b> <code>{dcb.get('ViewerProtocolPolicy')}</code>\n"
-        f"🚀 <b>HTTP Version:</b> <code>{cfg.get('HttpVersion')}</code>\n"
-        f"📦 <b>Compression:</b> <code>{'ON' if dcb.get('Compress') else 'OFF'}</code> · "
-        f"<b>IPv6:</b> <code>{'ON' if cfg.get('IsIPV6Enabled') else 'OFF'}</code>\n"
-        f"💲 <b>Price Class:</b> <code>{cfg.get('PriceClass')}</code>\n"
-        f"🌍 <b>Geo Restriction:</b> <code>{geo_type}</code> {esc(','.join(geo_items)) if geo_items else ''}\n"
-        f"🛡 <b>WAF WebACL:</b> <code>{esc(waf.split('/')[-1] if '/' in waf else waf)}</code></blockquote>"
+    geo_str = f'"{geo_type}"' + (f"  # {','.join(geo_items[:6])}" if geo_items else "")
+    card = yaml_card(
+        [
+            ("Cache", f'"{cache_lbl}"'),
+            ("Viewer", f'"{dcb.get("ViewerProtocolPolicy")}"'),
+            ("HTTP", f'"{cfg.get("HttpVersion")}"'),
+            ("Compress", "true" if dcb.get("Compress") else "false"),
+            ("IPv6", "true" if cfg.get("IsIPV6Enabled") else "false"),
+            ("Price", f'"{cfg.get("PriceClass", "-").replace("PriceClass_", "")}"'),
+            ("Geo", geo_str),
+            ("WAF", f'"{waf.split("/")[-1] if "/" in waf else waf}"'),
+        ]
     )
+    text = f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › ⚙️ <b>Settings</b>\n━━━━━━━━━━━━━━━━━━━━\n{card}"
     rows = [
         [
             B("⚡ Toggle Cache", await cb_put(uid, "s_cache", acc=acc, did=did)),
@@ -1385,13 +1442,14 @@ async def h_pm(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     cf = await aws_client(uid, acc, "cloudfront")
     m_cnt, recent = await run(cf_month_invalidations, cf, did)
     lines = [
-        f"• <code>{i['Id']}</code> · {i['Status']} ({i['CreateTime'].strftime('%d/%m %H:%M')})"
+        f"• <code>{i['Id']}</code> · <b>{i['Status']}</b> ({i['CreateTime'].strftime('%d/%m %H:%M')})"
         for i in recent
     ]
     text = (
         f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 🧹 <b>Purge / Invalidation</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>📊 <b>Mwezi huu:</b> <code>{m_cnt} / {FREE_TIER_INV}</code> (Free Tier)\n"
+        f"<blockquote>📊 <b>Mwezi huu:</b> <code>{m_cnt} / {FREE_TIER_INV}</code>\n"
+        f"{progress_bar(m_cnt, FREE_TIER_INV)}\n\n"
         + ("\n".join(lines) if lines else "<i>Hakuna invalidations za hivi karibuni.</i>")
         + "</blockquote>"
     )
@@ -1434,10 +1492,10 @@ async def h_bm(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     rows.append([B("⬅️ Back", await cb_put(uid, "d", acc=acc, did=did))])
     await show(
         u,
-        f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 💾 <b>Backup & Restore</b>\n"
+        f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 💾 <b>Backup &amp; Restore</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Backups zilizohifadhiwa: <b>{len(bks)}</b> (Max {MAX_BACKUPS_PER_DIST}).\n"
-        "Chagua backup ya kurudisha au pakua ya sasa:",
+        f"<blockquote>💾 Backups zilizopo: <b>{len(bks)}</b> / {MAX_BACKUPS_PER_DIST}\n"
+        "Chagua backup ya kurudisha au pakua ya sasa:</blockquote>",
         rows,
     )
 
@@ -1491,7 +1549,7 @@ async def h_rm(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     await show(
         u,
         f"⚠️ <b>Futa Distribution <code>{did}</code>?</b>\n\n"
-        "Ikiwa bado iko ON, itazimwa kwanza na utapata taarifa ikishakuwa <b>Deployed</b> ili ufute moja kwa moja.",
+        "<blockquote>Ikiwa bado iko ON, itazimwa kwanza na utapata taarifa ikishakuwa <b>Deployed</b> ili ufute moja kwa moja.</blockquote>",
         [
             [
                 B("🗑 Ndiyo, Endelea", await cb_put(uid, "rmok", acc=acc, did=did)),
@@ -1532,21 +1590,35 @@ async def h_rmok(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
     await show(u, f"✅ Distribution <code>{did}</code> imefutwa kabisa.", [[B("⬅️ List", await cb_put(uid, "dl", acc=acc, pg=0))]])
 
 
-# ============================= CLOUDFRONT ANALYTICS & ACM =============================
+# ============================= CLOUDFRONT ANALYTICS (DATA + REQUESTS) & ACM =============================
 async def h_us(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
     uid, acc, did = u.effective_user.id, p["acc"], p["did"]
-    await show_loading(u, "Inavuta takwimu kutoka CloudWatch...")
+    await show_loading(u, "Inavuta Data & Requests kutoka CloudWatch...")
     cw = await aws_client(uid, acc, "cloudwatch", "us-east-1")
     m = await run(cw_cf_metrics, cw, did)
-    pct = m["gb"] / FREE_TIER_GB * 100
+    gb_pct = m["gb"] / FREE_TIER_GB * 100
+    req_pct = m["requests"] / FREE_TIER_REQ * 100
+
+    card = yaml_card(
+        [
+            ("Data_Mo", f"{m['gb']:.2f} GB  # {gb_pct:.1f}% of 1TB"),
+            ("Data_24h", f"{m['gb_24h']:.2f} GB"),
+            ("Reqs_Mo", f"{int(m['requests']):,}  # {req_pct:.1f}%"),
+            ("Reqs_24h", f"{int(m['requests_24h']):,}"),
+            ("Err_4xx", f"{m['err4xx']:.2f}%  # last 24h"),
+            ("Err_5xx", f"{m['err5xx']:.2f}%  # last 24h"),
+        ]
+    )
+    bars = (
+        f"<blockquote>📦 <b>Bandwidth (Mwezi):</b> <b>{m['gb']:.2f} / 1024 GB</b> ({gb_pct:.1f}%)\n"
+        f"{progress_bar(m['gb'], FREE_TIER_GB)}\n\n"
+        f"📈 <b>Requests (Mwezi):</b> <b>{fmt_num(m['requests'])} / 10M</b> ({req_pct:.1f}%)\n"
+        f"{progress_bar(m['requests'], FREE_TIER_REQ)}</blockquote>"
+    )
     text = (
         f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 📊 <b>Analytics</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>📦 <b>Bandwidth (Mwezi):</b> <code>{m['gb']:.2f} GB</code> ({pct:.1f}% ya 1TB)\n"
-        f"{progress_bar(m['gb'], FREE_TIER_GB)}\n"
-        f"📈 <b>Total Requests (Mwezi):</b> <code>{int(m['requests']):,}</code>\n"
-        f"⚠️ <b>4xx Error Rate (24h):</b> <code>{m['err4xx']:.2f}%</code>\n"
-        f"🔥 <b>5xx Error Rate (24h):</b> <code>{m['err5xx']:.2f}%</code></blockquote>"
+        f"{bars}{card}"
     )
     await show(
         u,
@@ -1560,27 +1632,48 @@ async def h_us(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
 
 async def h_ua(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
     uid, acc = u.effective_user.id, p["acc"]
-    await show_loading(u, f"Inavuta matumizi ya {acc} kwa mkupuo...")
+    await show_loading(u, f"Inavuta Data & Requests za {acc} kwa mkupuo...")
     cf = await aws_client(uid, acc, "cloudfront")
     cw = await aws_client(uid, acc, "cloudwatch", "us-east-1")
     ds = (await run(cf_all_dists, cf))[:30]
 
-    # Parallel CloudWatch queries with asyncio.gather!
-    gbs = await asyncio.gather(*(run(cw_cf_month_gb_only, cw, d["Id"]) for d in ds))
-    tot = sum(gbs)
-    paired = sorted(zip(ds, gbs), key=lambda x: x[1], reverse=True)
-    lines = []
-    for d, g in paired:
-        al = (d.get("Aliases", {}).get("Items") or [d.get("Comment") or d["DomainName"]])[0]
-        lines.append(f"• <code>{d['Id']}</code> {esc(al[:24])}: <b>{g:.2f} GB</b>")
+    # Parallel CloudWatch queries for BOTH Bandwidth (GB) AND Requests!
+    usage = await asyncio.gather(*(run(cw_cf_month_usage, cw, d["Id"]) for d in ds))
+    tot_gb = sum(x[0] for x in usage)
+    tot_req = sum(x[1] for x in usage)
+    gb_pct = tot_gb / FREE_TIER_GB * 100
+    req_pct = tot_req / FREE_TIER_REQ * 100
 
+    paired = sorted(zip(ds, usage), key=lambda x: (x[1][1], x[1][0]), reverse=True)
+    lines = []
+    for d, (g, r) in paired:
+        al = (d.get("Aliases", {}).get("Items") or [d.get("Comment") or d["DomainName"]])[0]
+        dot = "🟢" if d["Enabled"] else "🔴"
+        lines.append(f"{dot} <code>{d['Id']}</code> {esc(al[:16])}\n    └ <b>{g:.2f} GB</b> · <b>{fmt_num(r)} reqs</b>")
+
+    card = yaml_card(
+        [
+            ("Account", f'"{acc}"'),
+            ("Dists", f"{len(ds)}"),
+            ("Data_GB", f"{tot_gb:.2f} / 1024  # {gb_pct:.1f}%"),
+            ("Requests", f"{int(tot_req):,}  # {req_pct:.1f}%"),
+        ]
+    )
+    bars = (
+        f"<blockquote>📦 <b>Data:</b> <b>{tot_gb:.1f} / 1024 GB</b> ({gb_pct:.1f}%)\n"
+        f"{progress_bar(tot_gb, FREE_TIER_GB)}\n\n"
+        f"📈 <b>Requests:</b> <b>{fmt_num(tot_req)} / 10M</b> ({req_pct:.1f}%)\n"
+        f"{progress_bar(tot_req, FREE_TIER_REQ)}</blockquote>"
+    )
+    breakdown = (
+        f"\n<blockquote expandable><b>📋 Mgawanyo wa Distributions:</b>\n{chr(10).join(lines)}</blockquote>"
+        if lines
+        else "\n<i>Hakuna distributions.</i>"
+    )
     text = (
-        f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 📊 <b>Monthly Usage</b>\n"
+        f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 📊 <b>CloudFront Analytics</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>{progress_bar(tot, FREE_TIER_GB)} <b>{tot:.1f} / {int(FREE_TIER_GB)} GB</b> "
-        f"({tot / FREE_TIER_GB * 100:.1f}%)\n"
-        f"Distributions: <b>{len(ds)}</b></blockquote>\n"
-        + (f"<blockquote expandable>{chr(10).join(lines)}</blockquote>" if lines else "<i>Hakuna distributions.</i>")
+        f"{bars}{card}{breakdown}"
     )
     await show(u, text, [[B("🔄 Refresh", await cb_put(uid, "ua", acc=acc))], HOME_BTN])
 
@@ -1613,9 +1706,10 @@ async def h_cd(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     ]
     await show(
         u,
-        f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 🌍 <b>Domains & SSL</b>\n"
+        f"🏠 <b>Home</b> › ☁️ <code>{did}</code> › 🌍 <b>Domains &amp; SSL</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Chagua cheti kilichothibitishwa (🔐) au kagua cheti kinachosubiri (⏳):",
+        f"<blockquote>🔐 <b>Issued:</b> <code>{len(certs)}</code> · ⏳ <b>Pending:</b> <code>{len(pending)}</code>\n"
+        "Chagua cheti kilichothibitishwa (🔐) au kagua kinachosubiri (⏳):</blockquote>",
         rows,
     )
 
@@ -1630,9 +1724,9 @@ async def h_cp(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     if rec:
         msg += (
             "Weka CNAME hii kwenye DNS (Cloudflare: <b>DNS only</b>):\n"
-            f"<blockquote>Type: <code>{rec['Type']}</code>\n"
-            f"Name: <code>{esc(rec['Name'])}</code>\n"
-            f"Value: <code>{esc(rec['Value'])}</code></blockquote>"
+            f"<blockquote>╭ Type: <code>{rec['Type']}</code>\n"
+            f"├ Name: <code>{esc(rec['Name'])}</code>\n"
+            f"╰ Value: <code>{esc(rec['Value'])}</code></blockquote>"
         )
     await show(u, msg, [[B("⬅️ Back", await cb_put(uid, "cd", acc=acc, did=did))]])
 
@@ -1648,8 +1742,9 @@ async def h_cr(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
     c.user_data["flow"] = {"t": "c1", "acc": p["acc"]}
     await show(
         u,
-        f"➕ <b>Create CloudFront · {esc(p['acc'])}</b>\n\n"
-        "1/3 Tuma <b>Origin Domain</b> (mfano <code>ec2-1-2-3-4.compute-1.amazonaws.com</code>):",
+        f"➕ <b>Create CloudFront · {esc(p['acc'])}</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        "<blockquote><b>Hatua 1/3:</b> Tuma <b>Origin Domain</b>\n"
+        "Mfano: <code>ec2-1-2-3-4.compute-1.amazonaws.com</code></blockquote>",
         CANCEL_HOME,
     )
 
@@ -1677,7 +1772,7 @@ async def h_ec2_regions(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, An
     def_reg = accs[acc]["region"]
     rows = [[B("🔎 Scan All Active Regions", await cb_put(uid, "scan", acc=acc))]]
     pair = []
-    for code, label in POPULAR_REGIONS:
+    for code, _ in POPULAR_REGIONS:
         star = "⭐ " if code == def_reg else ""
         tok = await cb_put(uid, "e_list", acc=acc, reg=code)
         pair.append(B(f"{star}{code}", tok))
@@ -1691,15 +1786,16 @@ async def h_ec2_regions(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, An
         u,
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 🖥 <b>EC2 Regions</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Chagua region (⭐ default: <code>{def_reg}</code>) au bonyeza <b>Scan All</b>:",
+        f"<blockquote>⭐ Default Region: <code>{def_reg}</code>\nChagua region au bonyeza <b>Scan All</b>:</blockquote>",
         rows,
     )
 
 
 async def h_ec2_scan(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
     uid, acc = u.effective_user.id, p["acc"]
-    await show_loading(u, f"Ina-scan regions {len(POPULAR_REGIONS)} za {acc}...")
+    await show_loading(u, f"Ina-scan EC2 regions za {acc}...")
     found = await _scan_ec2_all_regions(uid, acc)
+    run_cnt = sum(1 for _, i in found if i["State"]["Name"] == "running")
     rows = []
     for reg, inst in found:
         name = ec2_tag_name(inst)
@@ -1715,7 +1811,8 @@ async def h_ec2_scan(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any])
         u,
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 🔎 <b>EC2 Scan</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Zilizopatikana: <b>{len(found)}</b> instances kwenye regions {len(POPULAR_REGIONS)}.",
+        f"<blockquote>╭ 🖥 <b>Zilizopatikana:</b> <code>{len(found)}</code>\n"
+        f"╰ 🟢 <b>Running:</b> <code>{run_cnt}</code> · 🔴 <b>Stopped:</b> <code>{len(found) - run_cnt}</code></blockquote>",
         rows,
     )
 
@@ -1726,6 +1823,7 @@ async def h_e_list(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -
     await show_loading(u, f"Inapakia EC2 ({reg})...")
     cl = await aws_client(uid, acc, "ec2", reg)
     insts = await run(ec2_list_instances, cl)
+    run_cnt = sum(1 for i in insts if i["State"]["Name"] == "running")
     rows = []
     for inst in insts:
         name = ec2_tag_name(inst)
@@ -1744,7 +1842,7 @@ async def h_e_list(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -
         u,
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 🖥 <b>{reg}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"EC2 Instances: <b>{len(insts)}</b>",
+        f"<blockquote>🖥 <b>Instances:</b> <code>{len(insts)}</code> (🟢 {run_cnt} running)</blockquote>",
         rows,
     )
 
@@ -1769,21 +1867,27 @@ async def show_ec2_detail(u: Update, c: ContextTypes.DEFAULT_TYPE, acc: str, reg
     pub_dns = inst.get("PublicDnsName") or "—"
     priv_ip = inst.get("PrivateIpAddress") or "—"
     eips = eips_r.get("Addresses", [])
-    eip_txt = f"Attached ({eips[0]['PublicIp']})" if eips else "None"
 
-    block = (
-        f"🆔 <b>ID:</b> <code>{iid}</code>\n"
-        f"🌐 <b>Public IP:</b> <code>{pub_ip}</code> · <b>EIP:</b> {eip_txt}\n"
-        f"🔗 <b>Public DNS:</b> <code>{esc(pub_dns)}</code>\n"
-        f"🏠 <b>Private IP:</b> <code>{priv_ip}</code>\n"
-        f"📊 <b>CPU (1h):</b> <code>{metrics['cpu']:.1f}%</code> · <b>Net Out (24h):</b> <code>{metrics['net_out_gb']:.2f} GB</code>\n"
-        f"🛡 <b>Ports:</b> <code>{esc(sg_summary[:90])}</code>"
+    card = yaml_card(
+        [
+            ("State", f'"{state.upper()}"  # {inst.get("InstanceType", "?")}'),
+            ("ElasticIP", "true" if eips else "false"),
+            ("CPU_1h", f"{metrics['cpu']:.1f}%"),
+            ("Net_Out", f"{metrics['net_out_gb']:.2f} GB  # last 24h"),
+            ("Ports", f'"{sg_summary[:32]}"'),
+        ]
+    )
+    copy_block = (
+        f"<blockquote>╭ 🆔 <b>ID:</b> <code>{iid}</code>\n"
+        f"├ 🌐 <b>Public IP:</b> <code>{pub_ip}</code>\n"
+        f"├ 🔗 <b>Public DNS:</b> <code>{esc(pub_dns)}</code>\n"
+        f"╰ 🏠 <b>Private IP:</b> <code>{priv_ip}</code></blockquote>"
     )
     text = (
         f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 🖥 <b>{reg}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{dot} <b>{esc(name)}</b> (<code>{inst.get('InstanceType')}</code>) · <i>{state}</i>\n\n"
-        f"<blockquote>{block}</blockquote>"
+        f"{dot} <b>{esc(name)}</b>\n"
+        f"{card}{copy_block}"
     )
 
     power_btn = (
@@ -1838,7 +1942,7 @@ async def h_e_term(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -
     await show(
         u,
         f"🚨 <b>HATARI: Terminate EC2 <code>{iid}</code>?</b>\n\n"
-        "Hatua hii itafuta server hii na disk yake <b>MOJA KWA MOJA</b>. Hutaweza kuirudisha!",
+        "<blockquote>Hatua hii itafuta server hii na disk yake <b>MOJA KWA MOJA</b>. Hutaweza kuirudisha!</blockquote>",
         [
             [
                 B("🔥 Ndiyo, Endelea (1/2)", await cb_put(uid, "e_term2", acc=acc, reg=reg, iid=iid)),
@@ -1891,8 +1995,8 @@ async def h_e_cf(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
     rows.append([B("⬅️ Back", await cb_put(uid, "e_det", acc=acc, reg=reg, iid=iid))])
     await show(
         u,
-        f"☁️ <b>Weka EC2 hii kuwa Origin ya CloudFront</b>\n\n"
-        f"DNS: <code>{esc(dns)}</code>\nChagua Distribution ya kubadilisha Origin yake:",
+        f"☁️ <b>Weka EC2 hii kuwa Origin ya CloudFront</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"<blockquote>🔗 DNS: <code>{esc(dns)}</code></blockquote>\nChagua Distribution:",
         rows,
     )
 
@@ -1905,8 +2009,9 @@ async def h_e_cf_set(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any])
     await db_add_watcher(uid, acc, "cf_deploy", did)
     await show(
         u,
-        f"✅ <b>Imefanikiwa!</b>\n\n"
-        f"Origin ya <code>{did}</code> sasa ni:\n<code>{esc(dns)}</code>\n\n"
+        f"✅ <b>Imefanikiwa!</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"<blockquote>☁️ Distribution: <code>{did}</code>\n"
+        f"🎯 Origin Mpya: <code>{esc(dns)}</code></blockquote>\n"
         "<i>Bot itakujulisha ikimaliza ku-deploy.</i>",
         [
             [B("☁️ Fungua CloudFront", await cb_put(uid, "d", acc=acc, did=did))],
@@ -1930,18 +2035,19 @@ async def h_e_sg(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
 
     lines = []
     rule_btns = []
-    for idx, perm in enumerate(sg.get("IpPermissions", [])):
+    for perm in sg.get("IpPermissions", []):
         proto = perm.get("IpProtocol")
         fp, tp = perm.get("FromPort"), perm.get("ToPort")
         p_str = "ALL" if proto == "-1" else (f"{fp}" if fp == tp else f"{fp}-{tp}")
         for r in perm.get("IpRanges", []):
             cidr = r.get("CidrIp")
-            lines.append(f"• {proto.upper()} <code>{p_str}</code> ← <code>{cidr}</code>")
+            badge = "🌐" if cidr == "0.0.0.0/0" else "🔒"
+            lines.append(f"{badge} {proto.upper()} <code>{p_str}</code> ← <code>{cidr}</code>")
             tok = await cb_put(uid, "sg_rm", acc=acc, reg=reg, iid=iid, sg=sgid, pr=proto, fp=fp, tp=tp, cidr=cidr)
             rule_btns.append([B(f"🔒 Funga {p_str} ({cidr})", tok)])
         for pl in perm.get("PrefixListIds", []):
             plid = pl.get("PrefixListId")
-            lines.append(f"• {proto.upper()} <code>{p_str}</code> ← <code>{plid}</code> (PrefixList)")
+            lines.append(f"☁️ {proto.upper()} <code>{p_str}</code> ← <code>{plid}</code> (CF)")
             tok = await cb_put(uid, "sg_rm", acc=acc, reg=reg, iid=iid, sg=sgid, pr=proto, fp=fp, tp=tp, pl=plid)
             rule_btns.append([B(f"🔒 Funga {p_str} ({plid})", tok)])
 
@@ -1983,13 +2089,19 @@ async def h_e_met(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) ->
     await show_loading(u, "Inavuta EC2 metrics...")
     cw = await aws_client(uid, acc, "cloudwatch", reg)
     m = await run(ec2_metrics, cw, iid)
+    card = yaml_card(
+        [
+            ("CPU_1h", f"{m['cpu']:.1f}%"),
+            ("Net_Out", f"{m['net_out_gb']:.3f} GB  # 24h"),
+            ("Net_In", f"{m['net_in_gb']:.3f} GB  # 24h"),
+        ]
+    )
     text = (
         f"🏠 <b>Home</b> › 🖥 <code>{iid}</code> › 📊 <b>Metrics</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>🔥 <b>CPU (Last 1h):</b> <code>{m['cpu']:.1f}%</code>\n"
-        f"{progress_bar(m['cpu'], 100.0)}\n"
-        f"📤 <b>Network Out (24h):</b> <code>{m['net_out_gb']:.3f} GB</code>\n"
-        f"📥 <b>Network In (24h):</b> <code>{m['net_in_gb']:.3f} GB</code></blockquote>"
+        f"<blockquote>🔥 <b>CPU Utilization:</b> <b>{m['cpu']:.1f}%</b>\n"
+        f"{progress_bar(m['cpu'], 100.0)}</blockquote>"
+        f"{card}"
     )
     await show(
         u,
@@ -2014,7 +2126,7 @@ async def h_e_eip(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) ->
         info = "⚪ Hakuna Elastic IP iliyounganishwa na EC2 hii.\n<i>Kumbuka: AWS hutoza $0.005/saa kwa Public IPv4.</i>"
         rows.append([B("➕ Allocate & Attach Elastic IP", await cb_put(uid, "eip_add", acc=acc, reg=reg, iid=iid))])
     rows.append([B("⬅️ Back", await cb_put(uid, "e_det", acc=acc, reg=reg, iid=iid))])
-    await show(u, f"🌐 <b>Elastic IP · <code>{iid}</code></b>\n\n<blockquote>{info}</blockquote>", rows)
+    await show(u, f"🌐 <b>Elastic IP · <code>{iid}</code></b>\n━━━━━━━━━━━━━━━━━━━━\n<blockquote>{info}</blockquote>", rows)
 
 
 async def h_eip_add(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
@@ -2088,8 +2200,8 @@ async def h_e_lt(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
     rows.append([B("⬅️ Back", await cb_put(uid, "e_list", acc=acc, reg=reg))])
     await show(
         u,
-        f"➕ <b>Launch EC2 via Template ({reg})</b>\n\n"
-        + ("Chagua Launch Template ya kuwasha server mpya:" if lts else "<i>Hakuna Launch Templates kwenye region hii. Unda moja kwenye AWS Console kwanza.</i>"),
+        f"➕ <b>Launch EC2 via Template ({reg})</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        + ("Chagua Launch Template ya kuwasha server mpya:" if lts else "<blockquote><i>Hakuna Launch Templates kwenye region hii.</i></blockquote>"),
         rows,
     )
 
@@ -2138,7 +2250,7 @@ async def h_e_ssm(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) ->
         u,
         f"💻 <b>Run Command (AWS SSM) · <code>{iid}</code></b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Inahitaji SSM Agent na IAM Role ya SSM kwenye EC2.</i>\nChagua amri:",
+        "<blockquote><i>Inahitaji SSM Agent na IAM Role ya SSM kwenye EC2.</i></blockquote>",
         rows,
     )
 
@@ -2173,7 +2285,7 @@ async def _exec_ssm(u: Update, acc: str, reg: str, iid: str, cmd_str: str) -> No
         u,
         f"{dot} <b>SSM Result ({st})</b>\n"
         f"<code>$ {esc(cmd_str)}</code>\n\n"
-        f"<blockquote expandable><code>{esc(body)}</code></blockquote>",
+        f'<pre><code class="language-bash">{esc(body)}</code></pre>',
         [[B("⬅️ Run Command", await cb_put(uid, "e_ssm", acc=acc, reg=reg, iid=iid))]],
     )
 
@@ -2199,7 +2311,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         return await h_home(u, c, {})
     t = f["t"]
     try:
-        # ---- Account Add ----
         if t == "aname":
             accs = await db_get_accounts(uid)
             if not re.fullmatch(r"\w{1,15}", txt) or txt in accs:
@@ -2218,7 +2329,8 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             c.user_data.pop("flow", None)
             await show(
                 u,
-                f"✅ Account <b>{esc(f['name'])}</b> imeunganishwa!\nAWS ID: <code>{me['Account']}</code>",
+                f"✅ <b>Account <code>{esc(f['name'])}</code> imeunganishwa!</b>\n"
+                f"<blockquote>🆔 AWS ID: <code>{me['Account']}</code></blockquote>",
                 [
                     [B("☁️ CloudFront", await cb_put(uid, "dl", acc=f["name"], pg=0)), B("🖥 EC2", await cb_put(uid, "ec2", acc=f["name"]))],
                     HOME_BTN,
@@ -2226,7 +2338,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
                 force_new=True,
             )
 
-        # ---- Bot Alert Thresholds ----
         elif t in ("set_cfp", "set_cpup"):
             if not txt.isdigit() or not 10 <= int(txt) <= 100:
                 return await show(u, "❌ Weka namba kati ya 10 na 100:", CANCEL_HOME)
@@ -2237,7 +2348,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
                 await db_update_settings(uid, alert_cpu_pct=int(txt))
             await h_bset(u, c, {})
 
-        # ---- CloudFront Origin Edits ----
         elif t == "origin":
             dom = clean_domain(txt)
             if not dom:
@@ -2283,7 +2393,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
                 cfg["Origins"]["Items"][oi]["CustomHeaders"] = {"Quantity": len(items), "Items": items}
             await cf_edit_and_watch(u, c, f["acc"], f["did"], _set_hdr, return_to="om", oi=oi)
 
-        # ---- CloudFront Settings Flows ----
         elif t == "s_lbl":
             c.user_data.pop("flow", None)
             await cf_edit_and_watch(u, c, f["acc"], f["did"], lambda cfg: cfg.__setitem__("Comment", txt[:128]), return_to="sm")
@@ -2312,7 +2421,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             )
             await show(u, f"✅ Purge imetumwa kwa paths: <code>{esc(', '.join(paths))}</code>", [[B("⬅️ Back", await cb_put(uid, "pm", acc=f["acc"], did=f["did"]))]])
 
-        # ---- CloudFront Custom Domain & ACM ----
         elif t == "alias":
             doms = [clean_domain(x) for x in re.split(r"[,\s]+", txt) if x.strip()]
             if not doms or None in doms:
@@ -2342,27 +2450,26 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             msg = "✅ <b>Cheti kimeombwa!</b>\n\nWeka CNAME hii kwenye DNS (Cloudflare: <b>DNS only</b>):\n"
             if rec:
                 msg += (
-                    f"<blockquote>Type: <code>{rec['Type']}</code>\n"
-                    f"Name: <code>{esc(rec['Name'])}</code>\n"
-                    f"Value: <code>{esc(rec['Value'])}</code></blockquote>\n"
+                    f"<blockquote>╭ Type: <code>{rec['Type']}</code>\n"
+                    f"├ Name: <code>{esc(rec['Name'])}</code>\n"
+                    f"╰ Value: <code>{esc(rec['Value'])}</code></blockquote>\n"
                 )
             else:
-                msg += "<i>Record bado inatengenezwa, fungua Domains & SSL → Pending baada ya sekunde chache.</i>\n"
+                msg += "<i>Record bado inatengenezwa, fungua Domains &amp; SSL → Pending baada ya sekunde chache.</i>\n"
             msg += "🔔 Bot inakifuatilia na itakutumia ujumbe mara kitakapokuwa <b>ISSUED</b>."
             await show(u, msg, [[B("🌍 Domains & SSL", await cb_put(uid, "cd", acc=f["acc"], did=f["did"]))]])
 
-        # ---- Create CloudFront ----
         elif t == "c1":
             dom = clean_domain(txt)
             if not dom:
                 return await show(u, "❌ Domain si sahihi. Jaribu tena:", CANCEL_HOME)
             f.update(t="c2", origin=dom)
-            await show(u, "2/3 Tuma <b>Port</b> ya origin (mfano <code>80</code> au <code>8080</code>):", CANCEL_HOME)
+            await show(u, "<blockquote><b>Hatua 2/3:</b> Tuma <b>Port</b> ya origin (mfano <code>80</code> au <code>8080</code>):</blockquote>", CANCEL_HOME)
         elif t == "c2":
             if not txt.isdigit() or not 1 <= int(txt) <= 65535:
                 return await show(u, "❌ Port si sahihi (1–65535):", CANCEL_HOME)
             f.update(t="c3", port=int(txt))
-            await show(u, "3/3 Tuma <b>Jina / Label</b> ya distribution:", CANCEL_HOME)
+            await show(u, "<blockquote><b>Hatua 3/3:</b> Tuma <b>Jina / Label</b> ya distribution:</blockquote>", CANCEL_HOME)
         elif t == "c3":
             c.user_data.pop("flow", None)
             cf = await aws_client(uid, f["acc"], "cloudfront")
@@ -2371,7 +2478,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             await db_add_watcher(uid, f["acc"], "cf_deploy", did)
             await show_cf_detail(u, c, f["acc"], did, with_metrics=False)
 
-        # ---- EC2 Security Group Add Port ----
         elif t == "sg_add":
             if not txt.isdigit() or not 1 <= int(txt) <= 65535:
                 return await show(u, "❌ Tuma namba ya port sahihi (1–65535):", CANCEL_HOME)
@@ -2389,7 +2495,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             await run(cl.authorize_security_group_ingress, GroupId=f["sg"], IpPermissions=[perm])
             await h_e_sg(u, c, {"acc": f["acc"], "reg": f["reg"], "iid": f["iid"]})
 
-        # ---- EC2 Custom SSM Command ----
         elif t == "ssm_cus":
             c.user_data.pop("flow", None)
             await _exec_ssm(u, f["acc"], f["reg"], f["iid"], txt)
@@ -2400,12 +2505,10 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ============================= BACKGROUND JOBS (WATCHERS & ALERTS) =============================
 async def job_watchers(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Checks pending CloudFront deployments & ACM certs every 30s and notifies user."""
     watchers = await db_list_watchers()
     now = int(time.time())
     for w in watchers:
         wid, uid, acc, kind, tid = w["id"], w["uid"], w["acc"], w["kind"], w["target_id"]
-        # Drop stale watchers older than 24h
         if now - w["created_at"] > 86400:
             await db_remove_watcher(wid)
             continue
@@ -2418,10 +2521,10 @@ async def job_watchers(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     await ctx.bot.send_message(
                         chat_id=uid,
                         text=(
-                            f"✅ <b>CloudFront Deployed!</b>\n\n"
-                            f"<blockquote>👤 Account: <code>{esc(acc)}</code>\n"
-                            f"🆔 ID: <code>{tid}</code>\n"
-                            f"📦 Hali: <b>Deployed ({state})</b></blockquote>"
+                            f"✅ <b>CloudFront Deployed!</b>\n"
+                            f"<blockquote>╭ 👤 Account: <code>{esc(acc)}</code>\n"
+                            f"├ 🆔 ID: <code>{tid}</code>\n"
+                            f"╰ 📦 Hali: <b>Deployed ({state})</b></blockquote>"
                         ),
                         parse_mode="HTML",
                     )
@@ -2434,10 +2537,10 @@ async def job_watchers(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     await ctx.bot.send_message(
                         chat_id=uid,
                         text=(
-                            f"🔐 <b>ACM SSL Certificate ISSUED!</b>\n\n"
-                            f"<blockquote>👤 Account: <code>{esc(acc)}</code>\n"
-                            f"🌍 Domain: <code>{esc(cert.get('DomainName'))}</code>\n"
-                            "Sasa unaweza kuiunganisha kwenye CloudFront → Domains & SSL.</blockquote>"
+                            f"🔐 <b>ACM SSL Certificate ISSUED!</b>\n"
+                            f"<blockquote>╭ 👤 Account: <code>{esc(acc)}</code>\n"
+                            f"├ 🌍 Domain: <code>{esc(cert.get('DomainName'))}</code>\n"
+                            "╰ Sasa unaweza kuiunganisha kwenye Domains &amp; SSL.</blockquote>"
                         ),
                         parse_mode="HTML",
                     )
@@ -2454,7 +2557,6 @@ async def job_watchers(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def job_health_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic check for CloudFront Free Tier threshold & high EC2 CPU."""
     all_accs = await db_get_all_accounts()
     ym = datetime.now(timezone.utc).strftime("%Y-%m")
     for row in all_accs:
@@ -2463,28 +2565,30 @@ async def job_health_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not st["alerts_on"]:
             continue
         try:
-            # 1) CloudFront Free Tier Usage Check
             cf = await aws_client(uid, acc, "cloudfront")
             cw = await aws_client(uid, acc, "cloudwatch", "us-east-1")
             ds = (await run(cf_all_dists, cf))[:25]
-            gbs = await asyncio.gather(*(run(cw_cf_month_gb_only, cw, d["Id"]) for d in ds))
-            tot_gb = sum(gbs)
-            pct = tot_gb / FREE_TIER_GB * 100
-            if pct >= st["alert_cf_pct"]:
+            usage = await asyncio.gather(*(run(cw_cf_month_usage, cw, d["Id"]) for d in ds))
+            tot_gb = sum(x[0] for x in usage)
+            tot_req = sum(x[1] for x in usage)
+            gb_pct = tot_gb / FREE_TIER_GB * 100
+            req_pct = tot_req / FREE_TIER_REQ * 100
+
+            if gb_pct >= st["alert_cf_pct"] or req_pct >= st["alert_cf_pct"]:
                 akey = f"cf:{uid}:{acc}:{ym}:{st['alert_cf_pct']}"
                 if not await db_alert_recently_sent(akey, cooldown_sec=7 * 86400):
                     await ctx.bot.send_message(
                         chat_id=uid,
                         text=(
-                            f"🚨 <b>CloudFront Free Tier Alert ({esc(acc)})</b>\n\n"
-                            f"<blockquote>{progress_bar(tot_gb, FREE_TIER_GB)} "
-                            f"<b>{tot_gb:.1f} / {int(FREE_TIER_GB)} GB ({pct:.0f}%)</b>\n"
-                            f"Umevuka kiwango chako cha tahadhari cha {st['alert_cf_pct']}%.</blockquote>"
+                            f"🚨 <b>CloudFront Free Tier Alert ({esc(acc)})</b>\n"
+                            f"<blockquote>📦 <b>Data:</b> {tot_gb:.1f} / 1024 GB ({gb_pct:.0f}%)\n"
+                            f"{progress_bar(tot_gb, FREE_TIER_GB)}\n\n"
+                            f"📈 <b>Requests:</b> {fmt_num(tot_req)} / 10M ({req_pct:.0f}%)\n"
+                            f"{progress_bar(tot_req, FREE_TIER_REQ)}</blockquote>"
                         ),
                         parse_mode="HTML",
                     )
 
-            # 2) EC2 High CPU Check (Default Region)
             ec2_cl = await aws_client(uid, acc, "ec2", def_reg)
             cw_ec2 = await aws_client(uid, acc, "cloudwatch", def_reg)
             insts = await run(ec2_list_instances, ec2_cl)
@@ -2499,9 +2603,10 @@ async def job_health_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         await ctx.bot.send_message(
                             chat_id=uid,
                             text=(
-                                f"🔥 <b>EC2 High CPU Alert ({esc(acc)} · {def_reg})</b>\n\n"
+                                f"🔥 <b>EC2 High CPU Alert ({esc(acc)} · {def_reg})</b>\n"
                                 f"<blockquote>🖥 Server: <b>{esc(ec2_tag_name(inst))}</b> (<code>{iid}</code>)\n"
-                                f"⚡ CPU: <b>{m['cpu']:.1f}%</b> (Limit: {st['alert_cpu_pct']}%)</blockquote>"
+                                f"⚡ CPU: <b>{m['cpu']:.1f}%</b>\n"
+                                f"{progress_bar(m['cpu'], 100.0)}</blockquote>"
                             ),
                             parse_mode="HTML",
                         )
@@ -2593,7 +2698,6 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     c.user_data.pop("flow", None)
     data = q.data or ""
     try:
-        # Static short callbacks
         if data == "home":
             return await h_home(u, c, {})
         if data == "help":
@@ -2617,14 +2721,12 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         if data.startswith("pk|"):
             return await h_pk(u, c, {"purpose": data.split("|", 1)[1]})
 
-        # Tokenized callbacks (safe against 64-byte limit & restarts)
         if data.startswith("t|"):
             payload = await cb_get(uid, data.split("|", 1)[1])
             if not payload:
                 return await show(u, "⌛ Kitufe hiki kimeisha muda. Rudi Menu Kuu:", [HOME_BTN])
             act = payload["a"]
 
-            # Flow-initiating tokenized actions
             if act == "or_ed":
                 back = await cb_put(uid, "om", acc=payload["acc"], did=payload["did"], oi=payload["oi"])
                 return await start_flow(u, c, {"t": "origin", **payload}, "🎯 Tuma <b>Origin Domain</b> mpya:", back)
@@ -2699,7 +2801,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Background jobs (Watchers every 30s, Health & Free Tier alerts every 30m)
     if app.job_queue:
         app.job_queue.run_repeating(job_watchers, interval=30, first=15)
         app.job_queue.run_repeating(job_health_alerts, interval=1800, first=120)
