@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-AWS Control Bot — CloudFront & EC2 Full Control Panel (Telegram) [v3 Pro]
+AWS Control Bot — CloudFront & EC2 Full Control Panel (Telegram) [v4 Pro]
 ===============================================================================
 Vipengele Vikuu:
-- Muonekano wa rangi (Clean Tree Cards + 🟩/🟨/🟥 bars + ▁▂▃▅▇█ Sparklines)
-- Smart Memory Cache (60s TTL) kwa kasi ya papo hapo kwenye Back/Menu
+- Muonekano safi wa rangi (Tree Cards + 🟩/🟨/🟥 bars + ▁▂▃▅▇█ Sparklines)
+- Smart Cache (60s TTL) + Boto3 Client Pool (kasi na RAM ndogo)
 - CloudFront Full Control: Data + Requests (10M), Sparklines, Clone 1-Click,
-  Origin Failover (Add/Switch Origin), Origin & Edge Latency Tester, HTTP/3,
-  HTTP/HTTPS Ports, Headers, Geo, WAF, ACM SSL, Purge & Backup/Restore
-- EC2 Full Control: Multi-Region Scan, Start/Stop/Reboot/Terminate (2-step),
-  Auto-Prompt ya DNS mpya baada ya Start, Multi-SG Firewall (TCP/UDP + Presets
-  + CloudFront Only), Elastic IP, EBS Snapshots, Launch Templates & SSM
-- Account Free Tier Tracker: Auto-detect (AWS Account & FreeTier APIs) +
-  Manual Date Countdown (12m/6m) + Tahadhari za kukaribia kuisha (30/14/7/1d)
-- Daily Morning Digest (EAT UTC+3) + Audit Log (SQLite)
+  Origin Failover + Smart 5xx Auto-Failover, Origin & Edge Latency Tester,
+  HTTP/3, HTTP/HTTPS Ports, Headers, Geo, WAF, ACM SSL, Purge & Backup/Restore
+- EC2 Full Control: Multi-Region Scan, Multi-Region CPU Alerts, Start Auto-DNS
+  Prompt, Multi-SG Firewall (Paginated + TCP/UDP + 1-Click Lock to CF + Presets),
+  Elastic IP, EBS Snapshots (Create & Delete), Launch Templates & SSM
+- Cost & Cleanup Protection: Live USD Bill Watchdog (CloudWatch Billing),
+  Zombie Resource Hunter (Volumes, Idle EIPs, Old Snapshots), Free Tier Tracker
+- Operations: Global Multi-Account Overview, Daily Morning Digest (EAT),
+  Encrypted SQLite DB Backup to Telegram & Audit Log
 - 100% compatible na run.py & freetier.py
 ===============================================================================
 """
@@ -29,6 +30,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -131,8 +133,9 @@ SG_QUICK_PRESETS = {
 
 DB_LOCK = asyncio.Lock()
 
-# ============================= SMART IN-MEMORY CACHE =============================
+# ============================= SMART CACHE & BOTO3 CLIENT POOL =============================
 _CACHE: Dict[Tuple[Any, ...], Tuple[float, Any]] = {}
+_CLIENT_POOL: Dict[Tuple[Any, ...], Any] = {}
 
 
 def cache_get(key: Tuple[Any, ...], ttl: float = CACHE_TTL_SEC) -> Any:
@@ -159,6 +162,10 @@ def cache_invalidate(uid: int, acc: Optional[str] = None, kind: Optional[str] = 
             if kind is not None and k[0] != kind:
                 continue
             _CACHE.pop(k, None)
+    if kind is None:
+        for k in list(_CLIENT_POOL.keys()):
+            if k[0] == uid and (acc is None or k[1] == acc):
+                _CLIENT_POOL.pop(k, None)
 
 
 # ============================= STORAGE (SQLite + Fernet) =============================
@@ -190,7 +197,10 @@ def init_db() -> None:
                 alert_cf_pct INTEGER DEFAULT 80,
                 alert_cpu_pct INTEGER DEFAULT 90,
                 digest_on INTEGER DEFAULT 1,
-                digest_hour INTEGER DEFAULT 8
+                digest_hour INTEGER DEFAULT 8,
+                bill_alert_usd REAL DEFAULT 1.0,
+                auto_failover INTEGER DEFAULT 0,
+                auto_backup_db INTEGER DEFAULT 1
             )
             """
         )
@@ -243,6 +253,9 @@ def init_db() -> None:
             "ALTER TABLE accounts ADD COLUMN ft_months INTEGER DEFAULT 12",
             "ALTER TABLE settings ADD COLUMN digest_on INTEGER DEFAULT 1",
             "ALTER TABLE settings ADD COLUMN digest_hour INTEGER DEFAULT 8",
+            "ALTER TABLE settings ADD COLUMN bill_alert_usd REAL DEFAULT 1.0",
+            "ALTER TABLE settings ADD COLUMN auto_failover INTEGER DEFAULT 0",
+            "ALTER TABLE settings ADD COLUMN auto_backup_db INTEGER DEFAULT 1",
         ]
         for sql in migrations:
             try:
@@ -389,10 +402,19 @@ async def db_get_settings(uid: int) -> Dict[str, Any]:
                         "alert_cpu_pct": 90,
                         "digest_on": 1,
                         "digest_hour": 8,
+                        "bill_alert_usd": 1.0,
+                        "auto_failover": 0,
+                        "auto_backup_db": 1,
                     }
                 d = dict(row)
                 d.setdefault("digest_on", 1)
                 d.setdefault("digest_hour", 8)
+                if d.get("bill_alert_usd") is None:
+                    d["bill_alert_usd"] = 1.0
+                if d.get("auto_failover") is None:
+                    d["auto_failover"] = 0
+                if d.get("auto_backup_db") is None:
+                    d["auto_backup_db"] = 1
                 return d
             finally:
                 conn.close()
@@ -549,18 +571,50 @@ async def db_get_audit(uid: int, limit: int = 20) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(_op)
 
 
+async def db_backup_bytes() -> bytes:
+    """Creates a WAL-safe, consistent SQLite snapshot in a temp file and returns its bytes."""
+    async with DB_LOCK:
+        def _op() -> bytes:
+            fd, tmp_path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            try:
+                src_conn = sqlite3.connect(DB_FILE)
+                dst_conn = sqlite3.connect(tmp_path)
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+                    src_conn.close()
+                with open(tmp_path, "rb") as f:
+                    return f.read()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        return await asyncio.to_thread(_op)
+
+
 # ============================= AWS CLIENT & VISUAL HELPERS =============================
 async def aws_client(uid: int, acc: str, svc: str = "cloudfront", region: str = "us-east-1"):
     accounts = await db_get_accounts(uid)
     if acc not in accounts:
         raise ValueError(f"Account '{acc}' haipo.")
     a = accounts[acc]
-    return boto3.client(
+    pkey = (uid, acc, svc, region, a["ak"][-12:])
+    cl = _CLIENT_POOL.get(pkey)
+    if cl is not None:
+        return cl
+    cl = boto3.client(
         svc,
         aws_access_key_id=dec(a["ak"]),
         aws_secret_access_key=dec(a["sk"]),
         region_name=region,
     )
+    if len(_CLIENT_POOL) > 128:
+        _CLIENT_POOL.clear()
+    _CLIENT_POOL[pkey] = cl
+    return cl
 
 
 async def run(fn: Callable, *args, **kwargs):
@@ -664,6 +718,12 @@ _KEY_ICONS: Dict[str, str] = {
     "EC2": "🖥",
     "EC2_Hrs": "🖥",
     "EC2_Run": "🖥",
+    "Bill_USD": "💵",
+    "Est_Bill": "💵",
+    "Bill_Alert": "💵",
+    "Failover": "🤖",
+    "DB_Backup": "📦",
+    "Zombies": "🧹",
 }
 
 
@@ -980,6 +1040,58 @@ def cw_cf_month_gb_only(cw, did: str) -> float:
     return gb
 
 
+def cw_cf_recent_5xx(cw, did: str, minutes: int = 10) -> Tuple[float, float]:
+    """Returns (avg_5xx_error_rate_pct, total_requests) over recent window for Smart Auto-Failover."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=minutes)
+    dims = [
+        {"Name": "DistributionId", "Value": did},
+        {"Name": "Region", "Value": "Global"},
+    ]
+    r_err = cw.get_metric_statistics(
+        Namespace="AWS/CloudFront",
+        MetricName="5xxErrorRate",
+        Dimensions=dims,
+        StartTime=start,
+        EndTime=now,
+        Period=300,
+        Statistics=["Average"],
+    )
+    r_req = cw.get_metric_statistics(
+        Namespace="AWS/CloudFront",
+        MetricName="Requests",
+        Dimensions=dims,
+        StartTime=start,
+        EndTime=now,
+        Period=300,
+        Statistics=["Sum"],
+    )
+    pts = [float(p["Average"]) for p in r_err.get("Datapoints", [])]
+    err5xx = (sum(pts) / len(pts)) if pts else 0.0
+    reqs = float(sum(p["Sum"] for p in r_req.get("Datapoints", [])))
+    return err5xx, reqs
+
+
+def cw_billing_usd(cw) -> Optional[float]:
+    """Reads free CloudWatch AWS/Billing EstimatedCharges (USD) metric in us-east-1."""
+    try:
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(hours=24)
+        r = cw.get_metric_statistics(
+            Namespace="AWS/Billing",
+            MetricName="EstimatedCharges",
+            Dimensions=[{"Name": "Currency", "Value": "USD"}],
+            StartTime=start,
+            EndTime=now,
+            Period=21600,
+            Statistics=["Maximum"],
+        )
+        pts = sorted(r.get("Datapoints", []), key=lambda x: x["Timestamp"])
+        return float(pts[-1]["Maximum"]) if pts else None
+    except Exception:
+        return None
+
+
 def cf_month_invalidations(cl, did: str) -> Tuple[int, List[Dict[str, Any]]]:
     r = cl.list_invalidations(DistributionId=did, MaxItems="50")
     items = r.get("InvalidationList", {}).get("Items", []) or []
@@ -1218,14 +1330,14 @@ async def h_home(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
         [
             ("Accounts", f"{len(accs)}  # {acc_list}"),
             ("FT_Expiry", exp_line),
-            ("Alerts", f'{"true" if alerts_on else "false"}  # CF≥{st["alert_cf_pct"]}% CPU≥{st["alert_cpu_pct"]}%'),
-            ("Digest", f'{"true" if st["digest_on"] else "false"}  # {st["digest_hour"]:02d}:00 EAT'),
+            ("Alerts", f'{"true" if alerts_on else "false"}  # CF≥{st["alert_cf_pct"]}% · Bill≥${st["bill_alert_usd"]:.2f}'),
+            ("Failover", f'{"true" if st["auto_failover"] else "false"}  # Digest {st["digest_hour"]:02d}:00 EAT'),
         ]
     )
     hint = (
-        "<blockquote>╭ 🟢 <b>Mfumo upo tayari (v3 Pro)</b>\n"
-        "├ ☁️ CloudFront: Data, Requests, Clone &amp; Failover\n"
-        "╰ 🖥 EC2: Scan, Multi-SG Firewall &amp; Free Tier Guard</blockquote>"
+        "<blockquote>╭ 🟢 <b>Mfumo upo tayari (v4 Pro)</b>\n"
+        "├ ☁️ CloudFront: Data, Requests, Clone &amp; 5xx Auto-Failover\n"
+        "╰ 🖥 EC2: Scan, Lock-to-CF Firewall, Bill Watchdog &amp; Zombies</blockquote>"
         if accs
         else "<blockquote>⚠️ <b>Bado hujaunganisha AWS account.</b>\n"
         "Bonyeza <b>👤 Accounts → ➕ Add Account</b> kuanza.</blockquote>"
@@ -1235,6 +1347,7 @@ async def h_home(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
         [B("☁️ CloudFront", "pk|dl"), B("🖥 EC2 Servers", "pk|ec2")],
         [B("➕ Create CF", "pk|cr"), B("🔎 Scan Regions", "pk|scan")],
         [B("📊 CF Analytics", "pk|ua"), B("🛡 Free Tier", "pk|ft")],
+        [B("🌐 Overview", "ov"), B("🧹 Hunt Zombies", "pk|zomb")],
         [B("👤 Accounts", "acc"), B(f"🔔 Alerts: {alerts_txt}", "tgl_al")],
         [B("⚙️ Settings & Logs", "bset"), B("❓ Msaada", "help")],
     ]
@@ -1255,17 +1368,21 @@ async def h_bset(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
         [
             ("Alerts", "true" if st["alerts_on"] else "false"),
             ("CF_Alert", f"{st['alert_cf_pct']}%  # GB & Requests"),
-            ("CPU_Alert", f"{st['alert_cpu_pct']}%"),
-            ("Digest", "true" if st["digest_on"] else "false"),
-            ("Digest_Hr", f"{st['digest_hour']:02d}:00 EAT (UTC+{TZ_OFFSET_HRS})"),
+            ("CPU_Alert", f"{st['alert_cpu_pct']}%  # All Active Regions"),
+            ("Bill_Alert", f"${st['bill_alert_usd']:.2f} USD  # CloudWatch Billing"),
+            ("Failover", "true" if st["auto_failover"] else "false"),
+            ("Digest", f'{"true" if st["digest_on"] else "false"}  # {st["digest_hour"]:02d}:00 EAT'),
+            ("DB_Backup", "true" if st["auto_backup_db"] else "false"),
         ]
     )
     text = f"🏠 <b>Home</b> › ⚙️ <b>Bot Settings</b>\n━━━━━━━━━━━━━━━━━━━━\n{card}"
     rows = [
         [B("🔔 Toggle Alerts", "tgl_al_s"), B("🌅 Toggle Digest", "tgl_dg")],
+        [B("🤖 Auto-Failover", "tgl_af"), B("📦 Weekly DB Backup", "tgl_dbb")],
         [B("📊 CF % Alert", "set_cfp"), B("🔥 CPU % Alert", "set_cpup")],
-        [B("⏰ Saa ya Digest", "set_dgh"), B("📨 Tuma Digest Sasa", "send_dg")],
-        [B("📜 Audit Log (Historia)", "audit"), B("🧹 Clear Cache", "clr_cache")],
+        [B("💵 Bill $ Alert", "set_bill"), B("⏰ Saa ya Digest", "set_dgh")],
+        [B("📨 Tuma Digest Sasa", "send_dg"), B("📦 Download DB Sasa", "dl_db")],
+        [B("📜 Audit Log", "audit"), B("🧹 Clear Cache", "clr_cache")],
         HOME_BTN,
     ]
     await show(u, text, rows)
@@ -1293,12 +1410,12 @@ async def h_audit(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) ->
 
 async def h_help(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
     text = (
-        "❓ <b>MWONGOZO WA AWS CONTROL BOT (v3 Pro)</b>\n"
+        "❓ <b>MWONGOZO WA AWS CONTROL BOT (v4 Pro)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>╭ 1️⃣ <b>CloudFront:</b> Data + Requests (10M), Sparklines, 🩺 Origin Tester, 📋 Clone 1-Click, 🔀 Origin Failover &amp; Backup/Restore.\n"
-        "├ 2️⃣ <b>EC2 Servers:</b> Scan Regions, Auto-DNS Prompt baada ya Start, Multi-SG Firewall (TCP/UDP + Presets + CF Only), EIP, Snapshots &amp; SSM.\n"
-        "├ 3️⃣ <b>🛡 Free Tier:</b> Inakagua muda wa akaunti (miezi 12/6), matumizi ya AWS Free Tier, na kukupa tahadhari kabla haijaisha.\n"
-        "╰ 4️⃣ <b>🌅 Daily Digest &amp; 📜 Audit Log:</b> Muhtasari wa kila asubuhi na rekodi ya kila badiliko.</blockquote>"
+        "<blockquote>╭ 1️⃣ <b>CloudFront:</b> Data + Requests (10M), Sparklines, 🩺 Origin Tester, 📋 Clone 1-Click, 🔀 Failover &amp; 🤖 Smart 5xx Auto-Failover.\n"
+        "├ 2️⃣ <b>EC2 Servers:</b> Multi-Region Scan &amp; CPU Alerts, Auto-DNS Prompt, Multi-SG Firewall (Paginated + 🔒 Lock-to-CF + TCP/UDP), EIP, Snapshots (Create/Delete) &amp; SSM.\n"
+        "├ 3️⃣ <b>💵 Bill Watchdog &amp; 🧹 Zombies:</b> Inafuatilia bili halisi ($ USD bure via CloudWatch) na kusaka Volumes/EIPs/Snapshots zinazokula hela.\n"
+        "╰ 4️⃣ <b>🌐 Overview, 📦 DB Backup &amp; 📜 Audit:</b> Muhtasari wa akaunti zote pamoja, backup ya DB kwenda Telegram &amp; historia ya mabadiliko.</blockquote>"
     )
     await show(u, text, [HOME_BTN])
 
@@ -1324,18 +1441,21 @@ async def h_ft(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
 
     # 2. Fetch live AWS Free Tier API + CloudFront + EC2 summary in parallel
     ft_mod = sys.modules.get("freetier")
+    cw_us = await aws_client(uid, acc, "cloudwatch", "us-east-1")
     cf_task = cf_all_dists_cached(uid, acc)
     ft_api_task = run(aws_try_freetier_api, ak, sk)
+    bill_task = run(cw_billing_usd, cw_us)
 
     if ft_mod and hasattr(ft_mod, "collect"):
-        ds, (ft_items, ft_err), ft_stat = await asyncio.gather(cf_task, ft_api_task, ft_mod.collect(uid, acc))
+        ds, (ft_items, ft_err), bill_usd, ft_stat = await asyncio.gather(
+            cf_task, ft_api_task, bill_task, ft_mod.collect(uid, acc)
+        )
         tot_gb, tot_req = ft_stat["gb"], ft_stat["req"]
         ec2_hrs, ec2_run, ebs_gb = ft_stat["hours"], len(ft_stat["running"]), ft_stat["ebs"]
         ec2_proj = ft_stat["proj"]
     else:
-        cw = await aws_client(uid, acc, "cloudwatch", "us-east-1")
-        ds, (ft_items, ft_err) = await asyncio.gather(cf_task, ft_api_task)
-        usage = await asyncio.gather(*(run(cw_cf_month_usage, cw, d["Id"]) for d in ds[:25]))
+        ds, (ft_items, ft_err), bill_usd = await asyncio.gather(cf_task, ft_api_task, bill_task)
+        usage = await asyncio.gather(*(run(cw_cf_month_usage, cw_us, d["Id"]) for d in ds[:25]))
         tot_gb = sum(x[0] for x in usage)
         tot_req = sum(x[1] for x in usage)
         ec2_hrs, ec2_run, ebs_gb, ec2_proj = 0.0, 0, 0, 0.0
@@ -1373,6 +1493,11 @@ async def h_ft(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
             progress_bar(ec2_hrs, 750.0),
             f"💽 <b>EC2 Running:</b> <code>{ec2_run}</code> · <b>EBS:</b> <code>{ebs_gb} / 30 GB</code>",
         ]
+    if bill_usd is not None:
+        b_dot = "🟢" if bill_usd <= 0.01 else ("🟡" if bill_usd < 1.0 else "🔴")
+        usage_lines.append(f"💵 <b>Est. Bill (USD):</b> {b_dot} <code>${bill_usd:.2f}</code>")
+    else:
+        usage_lines.append("💵 <b>Est. Bill (USD):</b> <i>Washa 'Receive Billing Alerts' AWS</i>")
     bars = f"<blockquote>{chr(10).join(usage_lines)}</blockquote>"
 
     # AWS Billing Free Tier API live breakdown (if IAM has freetier:GetFreeTierUsage)
@@ -1412,8 +1537,8 @@ async def h_ft(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
             B(f"⏱ Badili kuwa {next_m}m", await cb_put(uid, "ft_mon", acc=acc, m=next_m)),
         ],
         [
+            B("🧹 Hunt Zombies", await cb_put(uid, "zomb", acc=acc)),
             B("🔄 Refresh", await cb_put(uid, "ft", acc=acc)),
-            B("👤 Account Info", await cb_put(uid, "ai", acc=acc)),
         ],
         HOME_BTN,
     ]
@@ -1430,6 +1555,189 @@ async def h_ft_mon(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -
     await db_update_account_field(uid, acc, ft_months=m)
     await db_audit(uid, acc, "FT_DURATION", f"{m} months")
     await h_ft(u, c, {"acc": acc})
+
+
+# ============================= GLOBAL MULTI-ACCOUNT OVERVIEW =============================
+async def h_ov(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid = u.effective_user.id
+    accs = await db_get_accounts(uid)
+    if not accs:
+        return await show(
+            u,
+            "⚠️ <b>Hakuna AWS Account</b>\n<blockquote>Unganisha account yako ya AWS kwanza.</blockquote>",
+            [[B("➕ Add Account", "aa")], HOME_BTN],
+        )
+    await show_loading(u, f"Inakusanya muhtasari wa accounts {len(accs)}...")
+
+    async def _one_acc(acc: str, info: Dict[str, Any]) -> str:
+        try:
+            cw_us = await aws_client(uid, acc, "cloudwatch", "us-east-1")
+            ds, found_ec2, bill_usd = await asyncio.gather(
+                cf_all_dists_cached(uid, acc),
+                _scan_ec2_all_regions(uid, acc),
+                run(cw_billing_usd, cw_us),
+            )
+            usage = await asyncio.gather(*(run(cw_cf_month_usage, cw_us, d["Id"]) for d in ds[:20]))
+            tot_gb = sum(x[0] for x in usage)
+            tot_req = sum(x[1] for x in usage)
+            run_ec2 = sum(1 for _, i in found_ec2 if i["State"]["Name"] == "running")
+            ex = calc_ft_expiry(info["opened_at"], info["ft_months"])
+            bill_str = f"${bill_usd:.2f} USD" if bill_usd is not None else "n/a"
+            rows = [
+                ("Account", f'"{acc}"  # {len(ds)} CF · {run_ec2}/{len(found_ec2)} EC2'),
+                ("CF_Data", f"{tot_gb:.1f}/1024 GB  # {tot_gb / FREE_TIER_GB * 100:.0f}%"),
+                ("CF_Reqs", f"{fmt_num(tot_req)}/10M  # {tot_req / FREE_TIER_REQ * 100:.0f}%"),
+                ("Est_Bill", bill_str),
+            ]
+            if ex:
+                ft_s = "EXPIRED" if ex["days_left"] <= 0 else f"{ex['days_left']}d left"
+                rows.append(("FT_Left", f"{ft_s}  # exp {ex['end']}"))
+            return yaml_card(rows)
+        except Exception as e:
+            return f"<blockquote>⚠️ <b>{esc(acc)}:</b> {esc(str(e)[:120])}</blockquote>"
+
+    cards = await asyncio.gather(*(_one_acc(n, info) for n, info in accs.items()))
+    text = (
+        f"🏠 <b>Home</b> › 🌐 <b>Global Overview ({len(accs)} Accounts)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n\n".join(cards)
+    )
+    await show(u, text, [[B("🔄 Refresh", "ov")], HOME_BTN])
+
+
+# ============================= ZOMBIE RESOURCE HUNTER =============================
+def _zombie_scan_region(ec2_cl, reg: str) -> Dict[str, List[Dict[str, Any]]]:
+    res: Dict[str, List[Dict[str, Any]]] = {"vols": [], "eips": [], "stopped_eips": [], "snaps": []}
+    # 1. Unattached EBS Volumes (status = available)
+    for pg in ec2_cl.get_paginator("describe_volumes").paginate(Filters=[{"Name": "status", "Values": ["available"]}]):
+        for v in pg.get("Volumes", []):
+            res["vols"].append({"reg": reg, "id": v["VolumeId"], "gb": v.get("Size", 0), "type": v.get("VolumeType", "gp3")})
+
+    # 2. Idle Elastic IPs & EIPs attached to stopped instances
+    stopped_ids = set()
+    for inst in ec2_list_instances(ec2_cl):
+        if inst["State"]["Name"] == "stopped":
+            stopped_ids.add(inst["InstanceId"])
+    for a in ec2_cl.describe_addresses().get("Addresses", []):
+        if not a.get("AssociationId"):
+            res["eips"].append({"reg": reg, "aid": a["AllocationId"], "ip": a.get("PublicIp", "?")})
+        elif a.get("InstanceId") in stopped_ids:
+            res["stopped_eips"].append({"reg": reg, "aid": a["AllocationId"], "ip": a.get("PublicIp", "?"), "iid": a.get("InstanceId")})
+
+    # 3. Old EBS Snapshots (> 30 days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    snaps = ec2_cl.describe_snapshots(OwnerIds=["self"]).get("Snapshots", [])
+    for s in snaps:
+        if s["StartTime"] < cutoff:
+            age_d = (datetime.now(timezone.utc) - s["StartTime"]).days
+            res["snaps"].append({"reg": reg, "id": s["SnapshotId"], "gb": s.get("VolumeSize", 0), "age": age_d})
+    return res
+
+
+async def h_zomb(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc = u.effective_user.id, p["acc"]
+    await show_loading(u, f"Inasaka rasilimali zinazokula hela (Zombies) za {acc}...")
+    ft_mod = sys.modules.get("freetier")
+    if ft_mod and hasattr(ft_mod, "regions_of"):
+        regs = await ft_mod.regions_of(uid, acc)
+    else:
+        regs = [r for r, _ in POPULAR_REGIONS]
+
+    async def _one(reg: str):
+        try:
+            cl = await aws_client(uid, acc, "ec2", reg)
+            return await run(_zombie_scan_region, cl, reg)
+        except Exception:
+            return {"vols": [], "eips": [], "stopped_eips": [], "snaps": []}
+
+    chunks = await asyncio.gather(*(_one(r) for r in regs))
+    vols = [x for ch in chunks for x in ch["vols"]]
+    eips = [x for ch in chunks for x in ch["eips"]]
+    st_eips = [x for ch in chunks for x in ch["stopped_eips"]]
+    snaps = [x for ch in chunks for x in ch["snaps"]]
+
+    tot_z = len(vols) + len(eips) + len(st_eips) + len(snaps)
+    est_waste = (len(eips) + len(st_eips)) * 3.65 + sum(v["gb"] * 0.08 for v in vols) + sum(s["gb"] * 0.05 for s in snaps)
+
+    lines = []
+    rows = []
+    if not tot_z:
+        lines.append("🟢 <b>Safi kabisa!</b> Hakuna volumes zilizotelekezwa, EIPs zilizolala, wala snapshots za zamani (&gt;30d).")
+    else:
+        lines.append(f"⚠️ Zimepatikana <b>{tot_z}</b> · Makadirio ya upotevu: <code>~${est_waste:.2f}/mwezi</code>")
+        for v in vols[:6]:
+            lines.append(f"💽 Vol <code>{v['id']}</code> ({v['reg']}) · {v['gb']}GB {v['type']}")
+            rows.append([B(f"🗑 Futa Vol {v['id']} ({v['gb']}GB)", await cb_put(uid, "z_vol", acc=acc, reg=v["reg"], vid=v["id"]))])
+        for e in eips[:6]:
+            lines.append(f"💸 Idle EIP <code>{e['ip']}</code> ({e['reg']})")
+            rows.append([B(f"🗑 Release EIP {e['ip']}", await cb_put(uid, "z_eip", acc=acc, reg=e["reg"], aid=e["aid"], ip=e["ip"]))])
+        for se in st_eips[:4]:
+            lines.append(f"🟠 EIP kwenye Stopped EC2: <code>{se['ip']}</code> → <code>{se['iid']}</code> ({se['reg']})")
+        for s in snaps[:6]:
+            lines.append(f"📸 Old Snap <code>{s['id']}</code> ({s['reg']}) · {s['age']}d · {s['gb']}GB")
+            rows.append([B(f"🗑 Futa Snap {s['id']} ({s['age']}d)", await cb_put(uid, "z_snp", acc=acc, reg=s["reg"], sid=s["id"]))])
+
+    rows += [[B("🔄 Scan Tena", await cb_put(uid, "zomb", acc=acc)), B("🛡 Free Tier", await cb_put(uid, "ft", acc=acc))], HOME_BTN]
+    text = (
+        f"🏠 <b>Home</b> › 👤 <b>{esc(acc)}</b> › 🧹 <b>Zombie Resource Hunter</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"<blockquote>{chr(10).join(lines)}</blockquote>"
+    )
+    await show(u, text, rows)
+
+
+async def h_z_vol(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc, reg, vid = u.effective_user.id, p["acc"], p["reg"], p["vid"]
+    await show(
+        u,
+        f"⚠️ <b>Futa EBS Volume <code>{vid}</code> ({reg})?</b>\n<blockquote>Data ndani ya volume hii zitafutwa kabisa.</blockquote>",
+        [[B("🗑 Ndiyo, Futa", await cb_put(uid, "z_vol_ok", acc=acc, reg=reg, vid=vid)), B("❌ Hapana", await cb_put(uid, "zomb", acc=acc))]],
+    )
+
+
+async def h_z_vol_ok(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc, reg, vid = u.effective_user.id, p["acc"], p["reg"], p["vid"]
+    await show_loading(u, f"Inafuta volume {vid}...")
+    cl = await aws_client(uid, acc, "ec2", reg)
+    await run(cl.delete_volume, VolumeId=vid)
+    await db_audit(uid, acc, "ZOMBIE_DEL_VOL", f"{vid} ({reg})")
+    await h_zomb(u, c, {"acc": acc})
+
+
+async def h_z_eip(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc, reg, aid, ip = u.effective_user.id, p["acc"], p["reg"], p["aid"], p["ip"]
+    await show(
+        u,
+        f"⚠️ <b>Release Elastic IP <code>{ip}</code> ({reg})?</b>\n<blockquote>IP hii itaondolewa kwenye akaunti yako na haitatozwa tena.</blockquote>",
+        [[B("🗑 Ndiyo, Release", await cb_put(uid, "z_eip_ok", acc=acc, reg=reg, aid=aid, ip=ip)), B("❌ Hapana", await cb_put(uid, "zomb", acc=acc))]],
+    )
+
+
+async def h_z_eip_ok(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc, reg, aid, ip = u.effective_user.id, p["acc"], p["reg"], p["aid"], p["ip"]
+    await show_loading(u, f"Inaondoa EIP {ip}...")
+    cl = await aws_client(uid, acc, "ec2", reg)
+    await run(cl.release_address, AllocationId=aid)
+    await db_audit(uid, acc, "ZOMBIE_REL_EIP", f"{ip} ({reg})")
+    await h_zomb(u, c, {"acc": acc})
+
+
+async def h_z_snp(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc, reg, sid = u.effective_user.id, p["acc"], p["reg"], p["sid"]
+    await show(
+        u,
+        f"⚠️ <b>Futa Snapshot <code>{sid}</code> ({reg})?</b>",
+        [[B("🗑 Ndiyo, Futa", await cb_put(uid, "z_snp_ok", acc=acc, reg=reg, sid=sid)), B("❌ Hapana", await cb_put(uid, "zomb", acc=acc))]],
+    )
+
+
+async def h_z_snp_ok(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc, reg, sid = u.effective_user.id, p["acc"], p["reg"], p["sid"]
+    await show_loading(u, f"Inafuta snapshot {sid}...")
+    cl = await aws_client(uid, acc, "ec2", reg)
+    await run(cl.delete_snapshot, SnapshotId=sid)
+    await db_audit(uid, acc, "ZOMBIE_DEL_SNAP", f"{sid} ({reg})")
+    await h_zomb(u, c, {"acc": acc})
 
 
 # ============================= ACCOUNT PICKER & MANAGEMENT =============================
@@ -1452,6 +1760,7 @@ async def h_pk(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
             "ec2": (h_ec2_regions, {"acc": only_acc}),
             "scan": (h_ec2_scan, {"acc": only_acc}),
             "ft": (h_ft, {"acc": only_acc}),
+            "zomb": (h_zomb, {"acc": only_acc}),
         }
         if purpose in dispatch:
             fn, args = dispatch[purpose]
@@ -1464,6 +1773,7 @@ async def h_pk(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
         "ec2": "🖥 Chagua account (EC2 Servers):",
         "scan": "🔎 Scan EC2 Regions za account ipi?",
         "ft": "🛡 Free Tier & Muda wa account ipi?",
+        "zomb": "🧹 Hunt Zombies kwenye account ipi?",
     }
     rows = []
     for name in accs:
@@ -1868,11 +2178,9 @@ async def h_om(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> No
 async def h_or_sw(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
     """1-Click Failover: switches DefaultCacheBehavior TargetOriginId to selected origin."""
     oi = int(p.get("oi", 0))
-    switched_to = [""]
     def _fn(cfg):
         target = cfg["Origins"]["Items"][oi]
         cfg["DefaultCacheBehavior"]["TargetOriginId"] = target["Id"]
-        switched_to[0] = target["DomainName"]
     await cf_edit_and_watch(
         u, c, p["acc"], p["did"], _fn, return_to="om", oi=oi,
         audit_act="CF_FAILOVER", audit_det=f"-> origin#{oi+1}"
@@ -2724,6 +3032,7 @@ async def h_e_cf_set(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any])
 async def h_e_sg(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
     uid, acc, reg, iid = u.effective_user.id, p["acc"], p["reg"], p["iid"]
     sgi = int(p.get("sgi", 0))
+    pg = int(p.get("pg", 0))
     await show_loading(u, "Inasoma Security Groups...")
     cl = await aws_client(uid, acc, "ec2", reg)
     inst = await run(ec2_get_instance, cl, iid)
@@ -2746,25 +3055,36 @@ async def h_e_sg(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
             cidr = r.get("CidrIp")
             badge = "🌐" if cidr == "0.0.0.0/0" else "🔒"
             lines.append(f"{badge} {proto.upper()} <code>{p_str}</code> ← <code>{cidr}</code>")
-            tok = await cb_put(uid, "sg_rm", acc=acc, reg=reg, iid=iid, sg=sgid, sgi=sgi, pr=proto, fp=fp, tp=tp, cidr=cidr)
-            rule_btns.append([B(f"🔒 Funga {proto.upper()} {p_str} ({cidr})", tok)])
+            tok_rm = await cb_put(uid, "sg_rm", acc=acc, reg=reg, iid=iid, sg=sgid, sgi=sgi, pg=pg, pr=proto, fp=fp, tp=tp, cidr=cidr)
+            row_b = [B(f"🗑 {proto.upper()} {p_str} ({cidr})", tok_rm)]
+            # 1-Click Lock to CloudFront for Public TCP non-SSH ports
+            if proto == "tcp" and cidr == "0.0.0.0/0" and fp is not None and fp == tp and int(fp) != 22:
+                tok_lk = await cb_put(uid, "sg_lck", acc=acc, reg=reg, iid=iid, sg=sgid, sgi=sgi, pg=pg, pt=int(fp))
+                row_b.append(B(f"🔒 Lock {fp} → CF", tok_lk))
+            rule_btns.append(row_b)
         for pl in perm.get("PrefixListIds", []):
             plid = pl.get("PrefixListId")
             lines.append(f"☁️ {proto.upper()} <code>{p_str}</code> ← <code>{plid}</code> (CF)")
-            tok = await cb_put(uid, "sg_rm", acc=acc, reg=reg, iid=iid, sg=sgid, sgi=sgi, pr=proto, fp=fp, tp=tp, pl=plid)
-            rule_btns.append([B(f"🔒 Funga {proto.upper()} {p_str} ({plid})", tok)])
+            tok_rm = await cb_put(uid, "sg_rm", acc=acc, reg=reg, iid=iid, sg=sgid, sgi=sgi, pg=pg, pr=proto, fp=fp, tp=tp, pl=plid)
+            rule_btns.append([B(f"🗑 {proto.upper()} {p_str} ({plid})", tok_rm)])
+
+    per = 5
+    max_pg = max(0, (len(rule_btns) - 1) // per)
+    if pg > max_pg:
+        pg = max_pg
+    page_btns = rule_btns[pg * per : (pg + 1) * per]
 
     text = (
         f"🏠 <b>Home</b> › 🖥 <code>{iid}</code> › 🛡 <b>SG #{sgi + 1}/{len(sgs)} ({sgid})</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote><b>Inbound Rules ({esc(sg['GroupName'])}):</b>\n"
+        f"<blockquote><b>Inbound Rules ({esc(sg['GroupName'])} · {len(rule_btns)} rules):</b>\n"
         + ("\n".join(lines) if lines else "<i>Hakuna inbound rules.</i>")
         + "</blockquote>"
     )
     rows = []
     if len(sgs) > 1:
         nxt = (sgi + 1) % len(sgs)
-        rows.append([B(f"🔀 Badili SG ({sgi + 1}/{len(sgs)})", await cb_put(uid, "e_sg", acc=acc, reg=reg, iid=iid, sgi=nxt))])
+        rows.append([B(f"🔀 Badili SG ({sgi + 1}/{len(sgs)})", await cb_put(uid, "e_sg", acc=acc, reg=reg, iid=iid, sgi=nxt, pg=0))])
     rows += [
         [
             B("🔓 TCP (Public)", await cb_put(uid, "sg_add", acc=acc, reg=reg, iid=iid, sg=sgid, sgi=sgi, src="pub", pr="tcp")),
@@ -2774,8 +3094,47 @@ async def h_e_sg(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> 
             B("🔓 UDP (Public)", await cb_put(uid, "sg_add", acc=acc, reg=reg, iid=iid, sg=sgid, sgi=sgi, src="pub", pr="udp")),
             B("⚡ Quick Presets", await cb_put(uid, "sg_pre", acc=acc, reg=reg, iid=iid, sg=sgid, sgi=sgi)),
         ],
-    ] + rule_btns[:7] + [[B("⬅️ Back", await cb_put(uid, "e_det", acc=acc, reg=reg, iid=iid))]]
+    ] + page_btns
+    nav = []
+    if pg > 0:
+        nav.append(B("◀️ Rules", await cb_put(uid, "e_sg", acc=acc, reg=reg, iid=iid, sgi=sgi, pg=pg - 1)))
+    if pg < max_pg:
+        nav.append(B("Rules ▶️", await cb_put(uid, "e_sg", acc=acc, reg=reg, iid=iid, sgi=sgi, pg=pg + 1)))
+    if nav:
+        rows.append(nav)
+    rows.append([B("⬅️ Back", await cb_put(uid, "e_det", acc=acc, reg=reg, iid=iid))])
     await show(u, text, rows)
+
+
+async def h_sg_lck(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    """Zero-downtime 1-Click Lock: authorizes CloudFront Prefix List FIRST, then revokes 0.0.0.0/0."""
+    uid, acc, reg, iid, sgid = u.effective_user.id, p["acc"], p["reg"], p["iid"], p["sg"]
+    sgi, pg, port = int(p.get("sgi", 0)), int(p.get("pg", 0)), int(p["pt"])
+    await show_loading(u, f"Inafunga port {port} iwe CloudFront Only (zero downtime)...")
+    cl = await aws_client(uid, acc, "ec2", reg)
+    pl_id = await run(ec2_get_cf_prefix_list_id, cl)
+    if not pl_id:
+        raise ValueError("CloudFront Managed Prefix List haikupatikana kwenye region hii.")
+    cf_perm = {
+        "IpProtocol": "tcp",
+        "FromPort": port,
+        "ToPort": port,
+        "PrefixListIds": [{"PrefixListId": pl_id, "Description": "CloudFront Only (Bot Lock)"}],
+    }
+    try:
+        await run(cl.authorize_security_group_ingress, GroupId=sgid, IpPermissions=[cf_perm])
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "InvalidPermission.Duplicate":
+            raise
+    pub_perm = {
+        "IpProtocol": "tcp",
+        "FromPort": port,
+        "ToPort": port,
+        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+    }
+    await run(cl.revoke_security_group_ingress, GroupId=sgid, IpPermissions=[pub_perm])
+    await db_audit(uid, acc, "SG_LOCK_CF", f"{sgid} tcp/{port}")
+    await h_e_sg(u, c, {"acc": acc, "reg": reg, "iid": iid, "sgi": sgi, "pg": pg})
 
 
 async def h_sg_pre(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
@@ -2813,7 +3172,7 @@ async def h_sg_pre_go(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]
         perm["IpRanges"] = [{"CidrIp": "0.0.0.0/0", "Description": "Public (Bot)"}]
     await run(cl.authorize_security_group_ingress, GroupId=sgid, IpPermissions=[perm])
     await db_audit(uid, acc, "SG_OPEN", f"{sgid} {proto}/{port} ({src})")
-    await h_e_sg(u, c, {"acc": acc, "reg": reg, "iid": iid, "sgi": sgi})
+    await h_e_sg(u, c, {"acc": acc, "reg": reg, "iid": iid, "sgi": sgi, "pg": int(p.get("pg", 0))})
 
 
 async def h_sg_rm(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
@@ -2920,6 +3279,8 @@ async def h_e_snap(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -
         [B(f"📸 Create Snapshot ({v})", await cb_put(uid, "snap_mk", acc=acc, reg=reg, iid=iid, vid=v))]
         for v in vols
     ]
+    for s in snaps[:5]:
+        rows.append([B(f"🗑 Futa {s['SnapshotId']} ({s['StartTime'].strftime('%d/%m')})", await cb_put(uid, "snap_rm", acc=acc, reg=reg, iid=iid, sid=s["SnapshotId"]))])
     rows.append([B("⬅️ Back", await cb_put(uid, "e_det", acc=acc, reg=reg, iid=iid))])
     await show(
         u,
@@ -2940,6 +3301,29 @@ async def h_snap_mk(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) 
     await run(cl.create_snapshot, VolumeId=vid, Description=desc)
     await db_audit(uid, acc, "EBS_SNAPSHOT", f"{vid} ({iid})")
     await h_e_snap(u, c, p)
+
+
+async def h_snap_rm(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc, reg, iid, sid = u.effective_user.id, p["acc"], p["reg"], p["iid"], p["sid"]
+    await show(
+        u,
+        f"⚠️ <b>Futa EBS Snapshot <code>{sid}</code>?</b>\n<blockquote>Hatua hii haiwezi kurudishwa.</blockquote>",
+        [
+            [
+                B("🗑 Ndiyo, Futa", await cb_put(uid, "snap_rm_ok", acc=acc, reg=reg, iid=iid, sid=sid)),
+                B("❌ Hapana", await cb_put(uid, "e_snap", acc=acc, reg=reg, iid=iid)),
+            ]
+        ],
+    )
+
+
+async def h_snap_rm_ok(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
+    uid, acc, reg, iid, sid = u.effective_user.id, p["acc"], p["reg"], p["iid"], p["sid"]
+    await show_loading(u, f"Inafuta snapshot {sid}...")
+    cl = await aws_client(uid, acc, "ec2", reg)
+    await run(cl.delete_snapshot, SnapshotId=sid)
+    await db_audit(uid, acc, "EBS_SNAP_DEL", f"{sid} ({reg})")
+    await h_e_snap(u, c, {"acc": acc, "reg": reg, "iid": iid})
 
 
 async def h_e_lt(u: Update, c: ContextTypes.DEFAULT_TYPE, p: Dict[str, Any]) -> None:
@@ -3126,6 +3510,17 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
                 return await show(u, "❌ Weka saa (0–23) kwa mfumo wa masaa 24 (mfano <code>8</code> kwa saa 2 asubuhi):", CANCEL_HOME)
             c.user_data.pop("flow", None)
             await db_update_settings(uid, digest_hour=int(txt))
+            await h_bset(u, c, {})
+        elif t == "set_bill":
+            try:
+                val = float(txt.replace("$", "").strip())
+                if not 0.01 <= val <= 10000.0:
+                    raise ValueError
+            except ValueError:
+                return await show(u, "❌ Weka kiasi halali cha USD (mfano <code>0.50</code> au <code>1.00</code>):", CANCEL_HOME)
+            c.user_data.pop("flow", None)
+            await db_update_settings(uid, bill_alert_usd=round(val, 2))
+            await db_audit(uid, "bot", "SET_BILL_ALERT", f"${val:.2f}")
             await h_bset(u, c, {})
 
         # ---- CloudFront Clone (1-Click) ----
@@ -3383,18 +3778,20 @@ async def send_daily_digest_for_user(bot_obj, uid: int) -> None:
             tot_gb = sum(x[0] for x in usage)
             tot_req = sum(x[1] for x in usage)
 
-            reg = info["region"]
-            ec2_cl = await aws_client(uid, acc, "ec2", reg)
-            insts = await run(ec2_list_instances, ec2_cl)
-            run_cnt = sum(1 for i in insts if i["State"]["Name"] == "running")
-
+            found_ec2, bill_usd = await asyncio.gather(
+                _scan_ec2_all_regions(uid, acc),
+                run(cw_billing_usd, cw),
+            )
+            run_cnt = sum(1 for _, i in found_ec2 if i["State"]["Name"] == "running")
             ex = calc_ft_expiry(info["opened_at"], info["ft_months"])
             rows = [
                 ("Account", f'"{acc}"'),
                 ("CF_Data", f"{tot_gb:.1f}/1024 GB  # {tot_gb / FREE_TIER_GB * 100:.0f}%"),
                 ("CF_Reqs", f"{fmt_num(tot_req)}/10M  # {tot_req / FREE_TIER_REQ * 100:.0f}%"),
-                ("EC2", f"{run_cnt} running / {len(insts)}  # {reg}"),
+                ("EC2", f"{run_cnt} running / {len(found_ec2)}  # all regions"),
             ]
+            if bill_usd is not None:
+                rows.append(("Bill_USD", f"${bill_usd:.2f} USD"))
             if ex:
                 rows.append(("FT_Left", f"{max(0, ex['days_left'])} days  # exp {ex['end']}"))
             sections.append(yaml_card(rows))
@@ -3528,14 +3925,69 @@ async def job_health_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         parse_mode="HTML",
                     )
 
-            # 3) EC2 High CPU Check (Default Region)
-            ec2_cl = await aws_client(uid, acc, "ec2", def_reg)
-            cw_ec2 = await aws_client(uid, acc, "cloudwatch", def_reg)
-            insts = await run(ec2_list_instances, ec2_cl)
-            for inst in insts:
+            # 3) Live Dollar Watchdog (CloudWatch AWS/Billing EstimatedCharges — FREE)
+            bill_usd = await run(cw_billing_usd, cw)
+            if bill_usd is not None and bill_usd >= float(st["bill_alert_usd"]):
+                bkey = f"bill:{uid}:{acc}:{ym}:{int(bill_usd)}"
+                if not await db_alert_recently_sent(bkey, cooldown_sec=86400):
+                    await ctx.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            f"💵 <b>AWS Billing Watchdog ({esc(acc)})</b>\n"
+                            f"<blockquote>🚨 Makadirio ya bili yamefikia: <b>${bill_usd:.2f} USD</b>\n"
+                            f"🎯 Kikomo chako: <code>${st['bill_alert_usd']:.2f} USD</code>\n"
+                            "💡 Kagua <b>🛡 Free Tier</b> au <b>🧹 Hunt Zombies</b> mara moja.</blockquote>"
+                        ),
+                        parse_mode="HTML",
+                    )
+
+            # 4) Smart CloudFront 5xx Auto-Failover (for distributions with >=2 origins)
+            if st["auto_failover"]:
+                for d in ds:
+                    if not d.get("Enabled"):
+                        continue
+                    origins_items = d.get("Origins", {}).get("Items") or []
+                    if len(origins_items) < 2:
+                        continue
+                    did = d["Id"]
+                    err5xx, reqs_10m = await run(cw_cf_recent_5xx, cw, did, 10)
+                    if reqs_10m >= 10 and err5xx >= 50.0:
+                        fkey = f"autofail:{uid}:{acc}:{did}"
+                        if not await db_alert_recently_sent(fkey, cooldown_sec=1800):
+                            switched = ["", ""]
+                            def _auto_sw(cfg):
+                                items = cfg["Origins"]["Items"]
+                                if len(items) < 2:
+                                    return
+                                cur_id = cfg["DefaultCacheBehavior"]["TargetOriginId"]
+                                cur_idx = next((i for i, x in enumerate(items) if x["Id"] == cur_id), 0)
+                                nxt_item = items[(cur_idx + 1) % len(items)]
+                                switched[0] = items[cur_idx]["DomainName"]
+                                switched[1] = nxt_item["DomainName"]
+                                cfg["DefaultCacheBehavior"]["TargetOriginId"] = nxt_item["Id"]
+                            await run(cf_mutate, cf, did, _auto_sw)
+                            cache_invalidate(uid, acc, "cf_list")
+                            await db_add_watcher(uid, acc, "cf_deploy", did)
+                            await db_audit(uid, acc, "CF_AUTO_FAILOVER", f"{did} 5xx={err5xx:.0f}% -> {switched[1][:30]}")
+                            await ctx.bot.send_message(
+                                chat_id=uid,
+                                text=(
+                                    f"🤖 <b>Smart Auto-Failover Imetekelezwa!</b>\n"
+                                    f"<blockquote>╭ ☁️ Dist: <code>{did}</code> ({esc(acc)})\n"
+                                    f"├ 🔥 Sababu: 5xx <b>{err5xx:.1f}%</b> ({int(reqs_10m)} reqs / 10m)\n"
+                                    f"├ ❌ Kutoka: <code>{esc(switched[0])}</code>\n"
+                                    f"╰ ✅ Kwenda: <code>{esc(switched[1])}</code></blockquote>"
+                                ),
+                                parse_mode="HTML",
+                            )
+
+            # 5) Multi-Region EC2 High CPU Check (all active regions)
+            found_ec2 = await _scan_ec2_all_regions(uid, acc)
+            for reg, inst in found_ec2:
                 if inst["State"]["Name"] != "running":
                     continue
                 iid = inst["InstanceId"]
+                cw_ec2 = await aws_client(uid, acc, "cloudwatch", reg)
                 m = await run(ec2_metrics, cw_ec2, iid)
                 if m["cpu"] >= st["alert_cpu_pct"]:
                     akey = f"cpu:{uid}:{acc}:{iid}"
@@ -3543,7 +3995,7 @@ async def job_health_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         await ctx.bot.send_message(
                             chat_id=uid,
                             text=(
-                                f"🔥 <b>EC2 High CPU Alert ({esc(acc)} · {def_reg})</b>\n"
+                                f"🔥 <b>EC2 High CPU Alert ({esc(acc)} · {reg})</b>\n"
                                 f"<blockquote>🖥 Server: <b>{esc(ec2_tag_name(inst))}</b> (<code>{iid}</code>)\n"
                                 f"⚡ CPU: <b>{m['cpu']:.1f}%</b>\n"
                                 f"{progress_bar(m['cpu'], 100.0)}</blockquote>"
@@ -3553,7 +4005,7 @@ async def job_health_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             log.warning("Health alert error for %s/%s: %s", uid, acc, e)
 
-    # 4) Daily Morning Digest (runs automatically inside this job — no run.py changes needed)
+    # 6) Daily Morning Digest & Weekly Encrypted DB Auto-Backup
     for uid in seen_uids:
         try:
             st = await db_get_settings(uid)
@@ -3561,8 +4013,20 @@ async def job_health_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 dkey = f"digest:{uid}:{today_local}"
                 if not await db_alert_recently_sent(dkey, cooldown_sec=20 * 3600):
                     await send_daily_digest_for_user(ctx.bot, uid)
+            if st["auto_backup_db"]:
+                bkey = f"dbbak:{uid}"
+                if not await db_alert_recently_sent(bkey, cooldown_sec=7 * 86400):
+                    raw = await db_backup_bytes()
+                    buf = io.BytesIO(raw)
+                    buf.name = f"bot_data_{now_local.strftime('%Y%m%d')}.db"
+                    await ctx.bot.send_document(
+                        chat_id=uid,
+                        document=buf,
+                        caption="📦 <b>Weekly Auto-Backup (bot_data.db)</b>\n<i>Keys zimesimbwa kwa Fernet. Hifadhi SECRET_KEY yako salama.</i>",
+                        parse_mode="HTML",
+                    )
         except Exception as e:
-            log.warning("Daily digest error for %s: %s", uid, e)
+            log.warning("Digest/DB backup error for %s: %s", uid, e)
 
 
 # ============================= ROUTER & ERROR HANDLER =============================
@@ -3583,6 +4047,13 @@ TOKEN_HANDLERS: Dict[str, Callable] = {
     "adok": h_adok,
     "ft": h_ft,
     "ft_mon": h_ft_mon,
+    "zomb": h_zomb,
+    "z_vol": h_z_vol,
+    "z_vol_ok": h_z_vol_ok,
+    "z_eip": h_z_eip,
+    "z_eip_ok": h_z_eip_ok,
+    "z_snp": h_z_snp,
+    "z_snp_ok": h_z_snp_ok,
     "dl": h_dl,
     "d": h_d,
     "cf_tst": h_cf_tst,
@@ -3632,6 +4103,7 @@ TOKEN_HANDLERS: Dict[str, Callable] = {
     "e_sg": h_e_sg,
     "sg_pre": h_sg_pre,
     "sg_pre_go": h_sg_pre_go,
+    "sg_lck": h_sg_lck,
     "sg_rm": h_sg_rm,
     "e_met": h_e_met,
     "e_eip": h_e_eip,
@@ -3639,6 +4111,8 @@ TOKEN_HANDLERS: Dict[str, Callable] = {
     "eip_rel": h_eip_rel,
     "e_snap": h_e_snap,
     "snap_mk": h_snap_mk,
+    "snap_rm": h_snap_rm,
+    "snap_rm_ok": h_snap_rm_ok,
     "e_lt": h_e_lt,
     "e_lt_go": h_e_lt_go,
     "e_lt_ok": h_e_lt_ok,
@@ -3666,6 +4140,8 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             return await h_aa(u, c, {})
         if data == "bset":
             return await h_bset(u, c, {})
+        if data == "ov":
+            return await h_ov(u, c, {})
         if data == "audit":
             return await h_audit(u, c, {})
         if data == "clr_cache":
@@ -3681,6 +4157,29 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             st = await db_get_settings(uid)
             await db_update_settings(uid, digest_on=0 if st["digest_on"] else 1)
             return await h_bset(u, c, {})
+        if data == "tgl_af":
+            st = await db_get_settings(uid)
+            nv = 0 if st["auto_failover"] else 1
+            await db_update_settings(uid, auto_failover=nv)
+            await db_audit(uid, "bot", "AUTO_FAILOVER", "ON" if nv else "OFF")
+            return await h_bset(u, c, {})
+        if data == "tgl_dbb":
+            st = await db_get_settings(uid)
+            await db_update_settings(uid, auto_backup_db=0 if st["auto_backup_db"] else 1)
+            return await h_bset(u, c, {})
+        if data == "dl_db":
+            raw = await db_backup_bytes()
+            buf = io.BytesIO(raw)
+            buf.name = f"bot_data_{datetime.now(LOCAL_TZ).strftime('%Y%m%d_%H%M')}.db"
+            await u.get_bot().send_document(
+                chat_id=u.effective_chat.id,
+                document=buf,
+                caption="📦 <b>Encrypted Bot Backup (bot_data.db)</b>\n<i>Keys zimesimbwa kwa Fernet. Hifadhi SECRET_KEY yako salama.</i>",
+                parse_mode="HTML",
+            )
+            return
+        if data == "set_bill":
+            return await start_flow(u, c, {"t": "set_bill"}, "💵 Tuma kikomo cha tahadhari ya bili kwa USD (mfano <code>0.50</code> au <code>1.00</code>):", "bset")
         if data == "send_dg":
             await show_loading(u, "Inaandaa Daily Digest yako...")
             await send_daily_digest_for_user(u.get_bot(), uid)
@@ -3802,7 +4301,7 @@ def main() -> None:
     else:
         log.warning("JobQueue haipo! Weka: pip install 'python-telegram-bot[job-queue]'")
 
-    log.info("AWS Control Bot v3 Pro imeanza kufanya kazi...")
+    log.info("AWS Control Bot v4 Pro imeanza kufanya kazi...")
     app.run_polling(drop_pending_updates=True)
 
 
